@@ -48,7 +48,7 @@ jobs:
           except urllib.error.HTTPError as exc:
               if exc.code == 404:
                   with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-                      out.write("action=none\\n")
+                      out.write("action=none\n")
                   print("No monitor state found.")
                   raise SystemExit(0)
               raise
@@ -57,7 +57,7 @@ jobs:
           value = payload.get("value")
           if not value:
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-                  out.write("action=none\\n")
+                  out.write("action=none\n")
               print("Monitor state variable is empty.")
               raise SystemExit(0)
 
@@ -93,15 +93,15 @@ jobs:
           print(f"::add-mask::{access_token}")
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as envf:
-              envf.write(f"MONITOR_CAMPAIGN_ID={campaign_id}\\n")
-              envf.write(f"MONITOR_ADVERTISER_ID={advertiser_id}\\n")
-              envf.write(f"MONITOR_ACCESS_TOKEN={access_token}\\n")
-              envf.write(f"MONITOR_STARTED_AT={started_at.isoformat()}\\n")
-              envf.write(f"MONITOR_SPEND_LIMIT_EUR={spend_limit_eur}\\n")
+              envf.write(f"MONITOR_CAMPAIGN_ID={campaign_id}\n")
+              envf.write(f"MONITOR_ADVERTISER_ID={advertiser_id}\n")
+              envf.write(f"MONITOR_ACCESS_TOKEN={access_token}\n")
+              envf.write(f"MONITOR_STARTED_AT={started_at.isoformat()}\n")
+              envf.write(f"MONITOR_SPEND_LIMIT_EUR={spend_limit_eur}\n")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write(f"action={action}\\n")
-              out.write(f"age_hours={age_hours:.3f}\\n")
+              out.write(f"action={action}\n")
+              out.write(f"age_hours={age_hours:.3f}\n")
 
           print(f"Loaded monitor state for campaign {campaign_id}; age={age_hours:.2f}h; action={action}")
           PY
@@ -209,8 +209,8 @@ jobs:
           should_stop = spend >= spend_limit
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write(f"spend_eur={spend:.4f}\\n")
-              out.write(f"should_stop={'true' if should_stop else 'false'}\\n")
+              out.write(f"spend_eur={spend:.4f}\n")
+              out.write(f"should_stop={'true' if should_stop else 'false'}\n")
 
           print(f"Campaign spend={spend:.4f} EUR, limit={spend_limit:.4f} EUR, should_stop={should_stop}")
           PY
