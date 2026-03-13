@@ -1,0 +1,232 @@
+name: TikTok Boost Manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_link:
+        description: TikTok video URL to boost (or numeric item_id)
+        required: true
+        type: string
+      oauth_url:
+        description: TikTok OAuth callback URL that contains auth_code/code
+        required: true
+        type: string
+      source_campaign_name:
+        description: Exact campaign name to copy
+        required: false
+        default: acemate_Views_2026_03_12
+        type: string
+      date_tag:
+        description: Optional date tag (YYYY_MM_DD). Leave empty for UTC today.
+        required: false
+        default: ""
+        type: string
+      spend_limit_eur:
+        description: Auto-stop threshold in EUR for guard workflow
+        required: false
+        default: "10"
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  TIKTOK_BASE_URL: https://business-api.tiktok.com/open_api/v1.3
+  TIKTOK_ADVERTISER_ID: "7441895227339718673"
+  TIKTOK_APP_ID_DEFAULT: "7548665268394786817"
+  MONITOR_VAR_NAME: TIKTOK_MONITOR_STATE
+
+jobs:
+  boost:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Parse OAuth URL
+        id: oauth
+        shell: bash
+        env:
+          INPUT_OAUTH_URL: ${{ inputs.oauth_url }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import urllib.parse
+
+          oauth_url = os.environ["INPUT_OAUTH_URL"].strip()
+          parsed = urllib.parse.urlparse(oauth_url)
+          query = urllib.parse.parse_qs(parsed.query)
+
+          app_id = (query.get("app_id") or [""])[0].strip() or os.environ.get("TIKTOK_APP_ID_DEFAULT", "").strip()
+          auth_code = (query.get("auth_code") or query.get("code") or [""])[0].strip()
+
+          if not app_id:
+              print("::error::Unable to resolve app_id from oauth_url.")
+              sys.exit(1)
+
+          if not auth_code:
+              print("::error::oauth_url has no auth_code/code. Paste the CALLBACK URL after authorization, not the initial auth link.")
+              sys.exit(1)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"app_id={app_id}\\n")
+              fh.write(f"auth_code={auth_code}\\n")
+          PY
+
+      - name: Exchange auth_code for access_token
+        id: token
+        shell: bash
+        env:
+          TIKTOK_APP_SECRET: ${{ secrets.TIKTOK_APP_SECRET }}
+        run: |
+          curl -sS -X POST "${TIKTOK_BASE_URL}/oauth2/access_token/" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"app_id\":\"${{ steps.oauth.outputs.app_id }}\",
+              \"secret\":\"${TIKTOK_APP_SECRET}\",
+              \"auth_code\":\"${{ steps.oauth.outputs.auth_code }}\"
+            }" > token_response.json
+
+          python - <<'PY'
+          import json
+          import os
+          import sys
+
+          with open("token_response.json", "r", encoding="utf-8") as fh:
+              data = json.load(fh)
+
+          code = data.get("code")
+          if code not in (0, "0"):
+              print(f"::error::Token exchange failed: {data.get('message')} | body={data}")
+              sys.exit(1)
+
+          access_token = str(((data.get("data") or {}).get("access_token") or "")).strip()
+          if not access_token:
+              print("::error::No access_token returned.")
+              sys.exit(1)
+
+          print(f"::add-mask::{access_token}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"access_token={access_token}\\n")
+          PY
+
+      - name: Resolve date tag
+        id: date
+        shell: bash
+        env:
+          INPUT_DATE_TAG: ${{ inputs.date_tag }}
+        run: |
+          if [ -n "${INPUT_DATE_TAG}" ]; then
+            echo "date_tag=${INPUT_DATE_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "date_tag=$(date -u +%Y_%m_%d)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run automation
+        shell: bash
+        env:
+          TIKTOK_ACCESS_TOKEN: ${{ steps.token.outputs.access_token }}
+          TIKTOK_ADVERTISER_ID: ${{ env.TIKTOK_ADVERTISER_ID }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: C0A49B277UK
+          INPUT_SOURCE_CAMPAIGN_NAME: ${{ inputs.source_campaign_name }}
+          INPUT_VIDEO_LINK: ${{ inputs.video_link }}
+          DATE_TAG: ${{ steps.date.outputs.date_tag }}
+        run: |
+          python automation.py \
+            --source-campaign-name "${INPUT_SOURCE_CAMPAIGN_NAME}" \
+            --latest-item-id "${INPUT_VIDEO_LINK}" \
+            --date-tag "${DATE_TAG}" > run_result.json
+
+          cat run_result.json
+
+      - name: Parse run result
+        id: result
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+
+          with open("run_result.json", "r", encoding="utf-8") as fh:
+              result = json.load(fh)
+
+          if result.get("dry_run") is True:
+              print("::error::Unexpected dry_run result in GitHub workflow.")
+              sys.exit(1)
+
+          campaign_id = str(result.get("new_campaign_id") or "").strip()
+          campaign_name = str(result.get("new_campaign_name") or "").strip()
+          if not campaign_id:
+              print(f"::error::No new_campaign_id in run result: {result}")
+              sys.exit(1)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"campaign_id={campaign_id}\\n")
+              fh.write(f"campaign_name={campaign_name}\\n")
+          PY
+
+      - name: Save monitor state for hourly budget guard
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CAMPAIGN_ID: ${{ steps.result.outputs.campaign_id }}
+          CAMPAIGN_NAME: ${{ steps.result.outputs.campaign_name }}
+          TIKTOK_ACCESS_TOKEN: ${{ steps.token.outputs.access_token }}
+          SPEND_LIMIT_EUR: ${{ inputs.spend_limit_eur }}
+        run: |
+          python - <<'PY'
+          import datetime as dt
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GITHUB_TOKEN"]
+          var_name = os.environ["MONITOR_VAR_NAME"]
+
+          state = {
+              "campaign_id": os.environ["CAMPAIGN_ID"],
+              "campaign_name": os.environ["CAMPAIGN_NAME"],
+              "advertiser_id": os.environ["TIKTOK_ADVERTISER_ID"],
+              "access_token": os.environ["TIKTOK_ACCESS_TOKEN"],
+              "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+              "spend_limit_eur": str(os.environ["SPEND_LIMIT_EUR"]),
+          }
+
+          state_value = json.dumps(state, separators=(",", ":"))
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "Content-Type": "application/json",
+          }
+          get_url = f"https://api.github.com/repos/{repo}/actions/variables/{var_name}"
+          base_url = f"https://api.github.com/repos/{repo}/actions/variables"
+          body = json.dumps({"name": var_name, "value": state_value}).encode("utf-8")
+
+          exists = False
+          try:
+              req = urllib.request.Request(get_url, method="GET", headers=headers)
+              urllib.request.urlopen(req, timeout=20).read()
+              exists = True
+          except urllib.error.HTTPError as exc:
+              if exc.code != 404:
+                  raise
+
+          target_url = get_url if exists else base_url
+          method = "PATCH" if exists else "POST"
+          req = urllib.request.Request(target_url, data=body, method=method, headers=headers)
+          urllib.request.urlopen(req, timeout=20).read()
+          print(f"Stored monitor state in variable {var_name} (campaign_id={state['campaign_id']}).")
+          PY
