@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -215,6 +216,16 @@ class TikTokBoostAutomation:
 
         logging.info("Step 9/10: renaming ads and swapping creatives to latest post")
         updated_ad_ids = self._update_ads(ads, ad_name=date_tag, tiktok_item_id=latest_item_id)
+        ad_alignment = self._ensure_ads_alignment(
+            campaign_id=str(new_campaign_id),
+            ad_name=date_tag,
+            tiktok_item_id=latest_item_id,
+        )
+        if ad_alignment.get("mismatched_ad_ids"):
+            logging.warning(
+                "Some ads are still mismatched after retries: %s",
+                ad_alignment.get("mismatched_ad_ids"),
+            )
 
         enabled = {"campaign": False, "adgroups": 0, "ads": 0}
         if self.config.enable_entities:
@@ -236,6 +247,7 @@ class TikTokBoostAutomation:
             "ads_found": len(ads),
             "adgroups_bid_cleared": len(cleared_bid_adgroup_ids),
             "ads_updated": len(updated_ad_ids),
+            "ad_alignment": ad_alignment,
             "enabled": enabled,
         }
 
@@ -709,6 +721,96 @@ class TikTokBoostAutomation:
             logging.info("Updated ad %s", ad_id)
 
         return updated
+
+    def _ensure_ads_alignment(
+        self,
+        campaign_id: str,
+        ad_name: str,
+        tiktok_item_id: str,
+        max_attempts: int = 6,
+        sleep_seconds: int = 5,
+    ) -> dict[str, Any]:
+        fixed_ad_ids: set[str] = set()
+        mismatched_ad_ids: list[str] = []
+        target_item_id = str(tiktok_item_id)
+
+        for attempt in range(1, max_attempts + 1):
+            ads = self._get_entities_for_campaign("/ad/get/", campaign_id, "ads")
+            mismatched: list[dict[str, Any]] = []
+
+            for ad in ads:
+                current_name = str(ad.get("ad_name") or "").strip()
+                current_item_id = str(ad.get("tiktok_item_id") or "").strip()
+                if current_name != ad_name or current_item_id != target_item_id:
+                    mismatched.append(ad)
+
+            if not mismatched:
+                return {
+                    "attempts": attempt,
+                    "ads_seen": len(ads),
+                    "ads_fixed": len(fixed_ad_ids),
+                    "mismatched_ad_ids": [],
+                }
+
+            logging.info(
+                "Ad alignment attempt %d/%d: %d mismatched ads; applying corrective updates.",
+                attempt,
+                max_attempts,
+                len(mismatched),
+            )
+
+            mismatched_ad_ids = []
+            for ad in mismatched:
+                ad_id = _pick_id(ad, ["ad_id", "id"])
+                adgroup_id = _pick_id(ad, ["adgroup_id"])
+                if not ad_id or not adgroup_id:
+                    continue
+                mismatched_ad_ids.append(str(ad_id))
+
+                payload: dict[str, Any] = {
+                    "advertiser_id": self.config.advertiser_id,
+                    "ad_id": str(ad_id),
+                    "adgroup_id": str(adgroup_id),
+                    "ad_name": ad_name,
+                    "creatives": [{
+                        "ad_id": str(ad_id),
+                        "ad_name": ad_name,
+                        "ad_format": ad.get("ad_format") or "SINGLE_VIDEO",
+                        "identity_id": ad.get("identity_id"),
+                        "identity_type": ad.get("identity_type"),
+                        "tiktok_item_id": target_item_id,
+                    }],
+                }
+
+                try:
+                    self.client.post("/ad/update/", payload)
+                    fixed_ad_ids.add(str(ad_id))
+                except TikTokAPIError as exc:
+                    logging.warning(
+                        "Corrective /ad/update/ with creatives failed for ad %s (%s). Retrying rename-only.",
+                        ad_id,
+                        exc,
+                    )
+                    self.client.post(
+                        "/ad/update/",
+                        {
+                            "advertiser_id": self.config.advertiser_id,
+                            "ad_id": str(ad_id),
+                            "adgroup_id": str(adgroup_id),
+                            "ad_name": ad_name,
+                        },
+                    )
+                    fixed_ad_ids.add(str(ad_id))
+
+            if attempt < max_attempts:
+                time.sleep(sleep_seconds)
+
+        return {
+            "attempts": max_attempts,
+            "ads_seen": len(self._get_entities_for_campaign("/ad/get/", campaign_id, "ads")),
+            "ads_fixed": len(fixed_ad_ids),
+            "mismatched_ad_ids": mismatched_ad_ids,
+        }
 
     def _enable_adgroups(self, adgroups: list[dict[str, Any]]) -> int:
         ids: list[str] = []
