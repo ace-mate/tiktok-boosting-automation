@@ -58,22 +58,107 @@ jobs:
         run: |
           python - <<'PY'
           import os
+          import re
           import sys
           import urllib.parse
 
-          oauth_url = os.environ["INPUT_OAUTH_URL"].strip()
-          parsed = urllib.parse.urlparse(oauth_url)
-          query = urllib.parse.parse_qs(parsed.query)
+          raw_input = os.environ["INPUT_OAUTH_URL"].strip()
+          default_app_id = os.environ.get("TIKTOK_APP_ID_DEFAULT", "").strip()
 
-          app_id = (query.get("app_id") or [""])[0].strip() or os.environ.get("TIKTOK_APP_ID_DEFAULT", "").strip()
-          auth_code = (query.get("auth_code") or query.get("code") or [""])[0].strip()
+          if not raw_input:
+              print("::error::oauth_url input is empty.")
+              sys.exit(1)
+
+          params: dict[str, list[str]] = {}
+
+          def _add_params(qs: str) -> None:
+              parsed_qs = urllib.parse.parse_qs(qs, keep_blank_values=True)
+              for key, values in parsed_qs.items():
+                  if not values:
+                      continue
+                  params.setdefault(key, []).extend(values)
+
+          def _clean(value: str) -> str:
+              text = str(value or "").strip().strip('"').strip("'").strip()
+              text = text.replace("\r", "").replace("\n", " ")
+              text = text.split(" ", 1)[0].strip()
+              return text
+
+          candidates = [raw_input]
+          for part in re.split(r"\s+", raw_input):
+              part = part.strip()
+              if part and part not in candidates:
+                  candidates.append(part)
+
+          for candidate in candidates:
+              c = candidate.strip().strip('"').strip("'")
+              if not c:
+                  continue
+
+              if "=" in c and not c.lower().startswith(("http://", "https://")):
+                  _add_params(c.lstrip("?"))
+
+              parsed = urllib.parse.urlparse(c)
+              if parsed.query:
+                  _add_params(parsed.query)
+              if parsed.fragment:
+                  _add_params(parsed.fragment)
+
+              decoded = urllib.parse.unquote(c)
+              if decoded != c:
+                  if "=" in decoded and not decoded.lower().startswith(("http://", "https://")):
+                      _add_params(decoded.lstrip("?"))
+                  parsed_decoded = urllib.parse.urlparse(decoded)
+                  if parsed_decoded.query:
+                      _add_params(parsed_decoded.query)
+                  if parsed_decoded.fragment:
+                      _add_params(parsed_decoded.fragment)
+
+          # Support nested callback values in redirect_uri.
+          for redirect_value in params.get("redirect_uri", []):
+              decoded_redirect = urllib.parse.unquote(str(redirect_value))
+              parsed_redirect = urllib.parse.urlparse(decoded_redirect)
+              if parsed_redirect.query:
+                  _add_params(parsed_redirect.query)
+              if parsed_redirect.fragment:
+                  _add_params(parsed_redirect.fragment)
+
+          def _first(*keys: str) -> str:
+              for key in keys:
+                  for value in params.get(key, []):
+                      cleaned = _clean(value)
+                      if cleaned:
+                          return cleaned
+              return ""
+
+          app_id = _first("app_id") or default_app_id
+          auth_code = _first("auth_code", "code")
+
+          # Fallback regex extraction for messy pasted content.
+          if not app_id:
+              app_match = re.search(r"(?:^|[?&#\s])app_id=(\d+)", raw_input)
+              if app_match:
+                  app_id = app_match.group(1)
+          if not auth_code:
+              decoded_input = urllib.parse.unquote(raw_input)
+              code_match = re.search(r"(?:^|[?&#\s])(?:auth_code|code)=([A-Za-z0-9._-]+)", decoded_input)
+              if code_match:
+                  auth_code = code_match.group(1)
+          if not auth_code:
+              compact = re.sub(r"\s+", "", raw_input)
+              if re.fullmatch(r"[A-Za-z0-9._-]{20,}", compact):
+                  auth_code = compact
+
+          app_id_match = re.search(r"\d{8,}", str(app_id))
+          app_id = app_id_match.group(0) if app_id_match else ""
+          auth_code = re.split(r"[&#\s]", str(auth_code).strip())[0].strip()
 
           if not app_id:
               print("::error::Unable to resolve app_id from oauth_url.")
               sys.exit(1)
 
           if not auth_code:
-              print("::error::oauth_url has no auth_code/code. Paste the CALLBACK URL after authorization, not the initial auth link.")
+              print("::error::No auth_code/code found. Paste the CALLBACK URL after authorization (or paste the raw code).")
               sys.exit(1)
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
@@ -86,14 +171,25 @@ jobs:
         shell: bash
         env:
           TIKTOK_APP_SECRET: ${{ secrets.TIKTOK_APP_SECRET }}
+          OAUTH_APP_ID: ${{ steps.oauth.outputs.app_id }}
+          OAUTH_AUTH_CODE: ${{ steps.oauth.outputs.auth_code }}
         run: |
+          python - <<'PY'
+          import json
+          import os
+
+          payload = {
+              "app_id": os.environ["OAUTH_APP_ID"].strip(),
+              "secret": os.environ["TIKTOK_APP_SECRET"].strip(),
+              "auth_code": os.environ["OAUTH_AUTH_CODE"].strip(),
+          }
+          with open("token_request.json", "w", encoding="utf-8") as fh:
+              json.dump(payload, fh)
+          PY
+
           curl -sS -X POST "${TIKTOK_BASE_URL}/oauth2/access_token/" \
             -H "Content-Type: application/json" \
-            -d "{
-              \"app_id\":\"${{ steps.oauth.outputs.app_id }}\",
-              \"secret\":\"${TIKTOK_APP_SECRET}\",
-              \"auth_code\":\"${{ steps.oauth.outputs.auth_code }}\"
-            }" > token_response.json
+            --data @token_request.json > token_response.json
 
           python - <<'PY'
           import json
