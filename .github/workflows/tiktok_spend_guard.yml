@@ -244,6 +244,7 @@ jobs:
           PY
 
       - name: Disable campaign at spend threshold
+        id: disable_campaign
         if: steps.state.outputs.action == 'check' && steps.spend.outputs.should_stop == 'true'
         shell: bash
         run: |
@@ -280,4 +281,78 @@ jobs:
               raise RuntimeError(f"Disable failed: {body}")
 
           print(f"Campaign {campaign_id} disabled after crossing spend limit.")
+          PY
+
+      - name: Send Slack error notification
+        if: failure()
+        continue-on-error: true
+        shell: bash
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: C0A49B277UK
+          OUTCOME_STATE: ${{ steps.state.outcome }}
+          OUTCOME_SPEND: ${{ steps.spend.outcome }}
+          OUTCOME_DISABLE: ${{ steps.disable_campaign.outcome }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+          if not token:
+              print("SLACK_BOT_TOKEN not set; skipping failure Slack notification.")
+              raise SystemExit(0)
+
+          outcomes = [
+              ("Load latest monitor state artifact", os.environ.get("OUTCOME_STATE", "")),
+              ("Fetch campaign spend", os.environ.get("OUTCOME_SPEND", "")),
+              ("Disable campaign at spend threshold", os.environ.get("OUTCOME_DISABLE", "")),
+          ]
+          failed_step = next((name for name, outcome in outcomes if outcome == "failure"), "Unknown")
+
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          run_id = os.environ.get("GITHUB_RUN_ID", "")
+          actor = os.environ.get("GITHUB_ACTOR", "")
+          workflow = os.environ.get("GITHUB_WORKFLOW", "TikTok Spend Guard")
+          run_url = f"https://github.com/{repo}/actions/runs/{run_id}" if repo and run_id else ""
+
+          text = (
+              f":x: {workflow} failed\n"
+              f"Failed step: {failed_step}\n"
+              f"Actor: {actor}\n"
+              f"Run: {run_url}"
+          )
+
+          payload = {
+              "channel": os.environ.get("SLACK_CHANNEL_ID", "C0A49B277UK"),
+              "text": text,
+              "unfurl_links": False,
+              "unfurl_media": False,
+          }
+          req = urllib.request.Request(
+              url="https://slack.com/api/chat.postMessage",
+              method="POST",
+              data=json.dumps(payload).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Content-Type": "application/json; charset=utf-8",
+              },
+          )
+          try:
+              raw = urllib.request.urlopen(req, timeout=20).read().decode("utf-8")
+          except urllib.error.HTTPError as exc:
+              body = exc.read().decode("utf-8", errors="replace")
+              print(f"Slack notification failed with HTTP {exc.code}: {body}")
+              raise SystemExit(0)
+          except urllib.error.URLError as exc:
+              print(f"Slack notification network error: {exc}")
+              raise SystemExit(0)
+
+          result = json.loads(raw)
+          if not result.get("ok"):
+              print(f"Slack API returned error: {result}")
+          else:
+              print("Slack failure notification sent.")
           PY
