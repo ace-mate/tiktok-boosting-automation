@@ -133,7 +133,13 @@ jobs:
 
           code = data.get("code")
           if code not in (0, "0"):
-              print(f"::error::Token exchange failed: {data.get('message')} | body={data}")
+              message = str(data.get("message") or "")
+              if code in (40110, "40110"):
+                  print("::error::Token exchange failed: auth_code already used. Open the auth URL again and paste a fresh callback URL/code.")
+              elif code in (40131, "40131"):
+                  print("::error::Token exchange failed: auth_code expired. Re-authorize and paste a fresh callback URL/code immediately.")
+              else:
+                  print(f"::error::Token exchange failed: {message} | body={data}")
               sys.exit(1)
 
           access_token = str(((data.get("data") or {}).get("access_token") or "")).strip()
