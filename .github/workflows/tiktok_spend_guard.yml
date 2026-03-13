@@ -7,18 +7,18 @@ on:
 
 permissions:
   contents: read
-  actions: write
+  actions: read
 
 env:
   TIKTOK_BASE_URL: https://business-api.tiktok.com/open_api/v1.3
-  MONITOR_VAR_NAME: TIKTOK_MONITOR_STATE
+  MONITOR_ARTIFACT_NAME: tiktok-monitor-state
 
 jobs:
   spend-guard:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Load monitor state
+      - name: Load latest monitor state artifact
         id: state
         shell: bash
         env:
@@ -26,14 +26,16 @@ jobs:
         run: |
           python - <<'PY'
           import datetime as dt
+          import io
           import json
           import os
-          import urllib.error
+          import urllib.parse
           import urllib.request
+          import zipfile
 
           repo = os.environ["GITHUB_REPOSITORY"]
           token = os.environ["GITHUB_TOKEN"]
-          var_name = os.environ["MONITOR_VAR_NAME"]
+          artifact_name = os.environ["MONITOR_ARTIFACT_NAME"]
 
           headers = {
               "Authorization": f"Bearer {token}",
@@ -41,27 +43,45 @@ jobs:
               "X-GitHub-Api-Version": "2022-11-28",
           }
 
-          url = f"https://api.github.com/repos/{repo}/actions/variables/{var_name}"
-          try:
-              req = urllib.request.Request(url, method="GET", headers=headers)
-              raw = urllib.request.urlopen(req, timeout=20).read().decode("utf-8")
-          except urllib.error.HTTPError as exc:
-              if exc.code == 404:
-                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-                      out.write("action=none\n")
-                  print("No monitor state found.")
-                  raise SystemExit(0)
-              raise
+          list_url = (
+              f"https://api.github.com/repos/{repo}/actions/artifacts"
+              f"?name={urllib.parse.quote(artifact_name)}&per_page=100"
+          )
+          req = urllib.request.Request(list_url, method="GET", headers=headers)
+          payload = json.loads(urllib.request.urlopen(req, timeout=30).read().decode("utf-8"))
 
-          payload = json.loads(raw)
-          value = payload.get("value")
-          if not value:
+          artifacts = payload.get("artifacts") or []
+          artifacts = [a for a in artifacts if isinstance(a, dict) and not a.get("expired")]
+
+          if not artifacts:
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
                   out.write("action=none\n")
-              print("Monitor state variable is empty.")
+              print("No monitor state artifact found.")
               raise SystemExit(0)
 
-          state = json.loads(value)
+          artifacts.sort(key=lambda a: str(a.get("created_at") or ""), reverse=True)
+          artifact = artifacts[0]
+          artifact_id = str(artifact.get("id"))
+          archive_url = str(artifact.get("archive_download_url") or "").strip()
+          if not archive_url:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  out.write("action=none\n")
+              print("Latest monitor artifact has no archive_download_url.")
+              raise SystemExit(0)
+
+          req = urllib.request.Request(archive_url, method="GET", headers=headers)
+          zip_bytes = urllib.request.urlopen(req, timeout=30).read()
+
+          with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+              names = zf.namelist()
+              target = "monitor_state.json"
+              if target not in names:
+                  if len(names) == 1:
+                      target = names[0]
+                  else:
+                      raise RuntimeError(f"monitor_state.json not found in artifact files: {names}")
+              state = json.loads(zf.read(target).decode("utf-8"))
+
           campaign_id = str(state.get("campaign_id") or "").strip()
           advertiser_id = str(state.get("advertiser_id") or "").strip()
           access_token = str(state.get("access_token") or "").strip()
@@ -102,17 +122,25 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"action={action}\n")
               out.write(f"age_hours={age_hours:.3f}\n")
+              out.write(f"artifact_id={artifact_id}\n")
 
-          print(f"Loaded monitor state for campaign {campaign_id}; age={age_hours:.2f}h; action={action}")
+          print(
+              f"Loaded monitor artifact id={artifact_id} for campaign {campaign_id}; "
+              f"age={age_hours:.2f}h; action={action}"
+          )
           PY
 
       - name: Nothing to check
         if: steps.state.outputs.action == 'none'
-        run: echo "No active monitor state."
+        run: echo "No active monitor state artifact."
 
       - name: Warm-up period not reached
         if: steps.state.outputs.action == 'wait'
         run: echo "Skipping spend check; less than 6 hours since campaign launch (age=${{ steps.state.outputs.age_hours }}h)."
+
+      - name: Monitor state stale
+        if: steps.state.outputs.action == 'stale'
+        run: echo "Latest monitor artifact is stale (>30h). Skipping."
 
       - name: Fetch campaign spend
         id: spend
@@ -252,40 +280,4 @@ jobs:
               raise RuntimeError(f"Disable failed: {body}")
 
           print(f"Campaign {campaign_id} disabled after crossing spend limit.")
-          PY
-
-      - name: Clear monitor state after disable/stale
-        if: steps.state.outputs.action == 'stale' || (steps.state.outputs.action == 'check' && steps.spend.outputs.should_stop == 'true')
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          python - <<'PY'
-          import os
-          import urllib.error
-          import urllib.request
-
-          repo = os.environ["GITHUB_REPOSITORY"]
-          token = os.environ["GITHUB_TOKEN"]
-          var_name = os.environ["MONITOR_VAR_NAME"]
-
-          url = f"https://api.github.com/repos/{repo}/actions/variables/{var_name}"
-          req = urllib.request.Request(
-              url,
-              method="DELETE",
-              headers={
-                  "Authorization": f"Bearer {token}",
-                  "Accept": "application/vnd.github+json",
-                  "X-GitHub-Api-Version": "2022-11-28",
-              },
-          )
-
-          try:
-              urllib.request.urlopen(req, timeout=20).read()
-              print(f"Deleted monitor state variable {var_name}.")
-          except urllib.error.HTTPError as exc:
-              if exc.code == 404:
-                  print(f"Variable {var_name} already absent.")
-              else:
-                  raise
           PY
