@@ -142,7 +142,14 @@ class TikTokBoostAutomation:
     def run(self) -> dict[str, Any]:
         date_tag = self.config.date_tag
         logging.info("Step 1/10: date tag = %s", date_tag)
-        new_campaign_name = f"{self.config.campaign_name_substring}_{date_tag}"
+        desired_campaign_name = f"{self.config.campaign_name_substring}_{date_tag}"
+        new_campaign_name = self._make_unique_campaign_name(desired_campaign_name)
+        if new_campaign_name != desired_campaign_name:
+            logging.info(
+                "Campaign name %s already exists. Using unique name %s.",
+                desired_campaign_name,
+                new_campaign_name,
+            )
 
         if self.config.source_campaign_name_exact:
             logging.info("Step 2/10: finding source campaign by exact name '%s'", self.config.source_campaign_name_exact)
@@ -193,7 +200,7 @@ class TikTokBoostAutomation:
             }
 
         logging.info("Step 3/10: duplicating campaign %s", source_campaign_id)
-        new_campaign_id = self._copy_campaign(
+        new_campaign_id, new_campaign_name = self._copy_campaign(
             campaign_id=source_campaign_id,
             source_campaign=source_campaign,
             target_campaign_name=new_campaign_name,
@@ -393,7 +400,7 @@ class TikTokBoostAutomation:
         source_campaign: dict[str, Any],
         target_campaign_name: str,
         latest_item_id: str,
-    ) -> str:
+    ) -> tuple[str, str]:
         payload = {
             "advertiser_id": self.config.advertiser_id,
             "campaign_ids": [str(campaign_id)],
@@ -415,42 +422,51 @@ class TikTokBoostAutomation:
         new_campaign_id = _pick_id(data, ["new_campaign_id", "campaign_id", "campaign_ids", "ids"])
         if not new_campaign_id:
             raise RuntimeError(f"Unable to find new campaign id from /campaign/copy/ response: {data}")
-        return str(new_campaign_id)
+        return str(new_campaign_id), str(target_campaign_name)
 
     def _manual_duplicate_campaign(
         self,
         source_campaign: dict[str, Any],
         target_campaign_name: str,
         latest_item_id: str,
-    ) -> str:
+    ) -> tuple[str, str]:
         source_campaign_id = _pick_id(source_campaign, ["campaign_id", "id"])
         if not source_campaign_id:
             raise RuntimeError(f"Source campaign is missing id: {source_campaign}")
 
-        create_payload = self._build_campaign_create_payload(source_campaign, target_campaign_name)
-        try:
-            create_data = self.client.post("/campaign/create/", create_payload)
-            new_campaign_id = _pick_id(create_data, ["campaign_id", "new_campaign_id", "ids"])
-            if not new_campaign_id:
-                raise RuntimeError(f"Unable to extract campaign_id from /campaign/create/ response: {create_data}")
-            new_campaign_id = str(new_campaign_id)
-            logging.info("Fallback duplicate created campaign %s via /campaign/create/", new_campaign_id)
-        except TikTokAPIError as exc:
-            if "Campaign name already exists" not in str(exc):
-                raise
-            existing_campaign = self._find_campaign_by_exact_name(target_campaign_name)
-            existing_campaign_id = _pick_id(existing_campaign, ["campaign_id", "id"])
-            if not existing_campaign_id:
-                raise RuntimeError(
-                    f"Campaign name exists but could not resolve existing campaign id for '{target_campaign_name}'."
-                ) from exc
-            new_campaign_id = str(existing_campaign_id)
-            logging.warning(
-                "Campaign name '%s' already exists; reusing existing campaign %s.",
-                target_campaign_name,
-                new_campaign_id,
+        selected_campaign_name = str(target_campaign_name)
+        for _ in range(20):
+            create_payload = self._build_campaign_create_payload(source_campaign, selected_campaign_name)
+            try:
+                create_data = self.client.post("/campaign/create/", create_payload)
+                new_campaign_id = _pick_id(create_data, ["campaign_id", "new_campaign_id", "ids"])
+                if not new_campaign_id:
+                    raise RuntimeError(f"Unable to extract campaign_id from /campaign/create/ response: {create_data}")
+                new_campaign_id = str(new_campaign_id)
+                logging.info(
+                    "Fallback duplicate created campaign %s via /campaign/create/ (name=%s).",
+                    new_campaign_id,
+                    selected_campaign_name,
+                )
+                break
+            except TikTokAPIError as exc:
+                if "Campaign name already exists" not in str(exc):
+                    raise
+                next_name = self._make_unique_campaign_name(selected_campaign_name)
+                if next_name == selected_campaign_name:
+                    raise RuntimeError(
+                        f"Campaign name collision for '{selected_campaign_name}' and no unique suffix available."
+                    ) from exc
+                logging.warning(
+                    "Campaign name '%s' already exists; retrying with '%s'.",
+                    selected_campaign_name,
+                    next_name,
+                )
+                selected_campaign_name = next_name
+        else:
+            raise RuntimeError(
+                f"Unable to create a unique campaign name after retries starting from '{target_campaign_name}'."
             )
-            return new_campaign_id
 
         source_adgroups = self._get_entities_for_campaign("/adgroup/get/", source_campaign_id, "source_adgroups")
         adgroup_id_map: dict[str, str] = {}
@@ -495,7 +511,24 @@ class TikTokBoostAutomation:
         if created_ads != len(source_ads):
             raise RuntimeError(f"Created {created_ads} ads but source campaign has {len(source_ads)} ads.")
 
-        return new_campaign_id
+        return new_campaign_id, selected_campaign_name
+
+    def _make_unique_campaign_name(self, base_name: str) -> str:
+        campaigns = self._list_entities("/campaign/get/")
+        existing_names = {
+            str(campaign.get("campaign_name") or campaign.get("name") or "").strip()
+            for campaign in campaigns
+            if str(campaign.get("campaign_name") or campaign.get("name") or "").strip()
+        }
+        if base_name not in existing_names:
+            return base_name
+
+        suffix = 1
+        while True:
+            candidate = f"{base_name}_{suffix}"
+            if candidate not in existing_names:
+                return candidate
+            suffix += 1
 
     def _get_source_ads_for_manual_copy(
         self,
