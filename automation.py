@@ -1291,6 +1291,17 @@ def _coerce_tiktok_item_id(value: str) -> str:
 
 def _normalize_input_link(value: str) -> str:
     text = html.unescape(str(value).strip())
+    if not text:
+        return ""
+
+    urls = _extract_urls_from_text(text)
+    if urls:
+        for candidate in urls:
+            parsed = urllib.parse.urlparse(candidate)
+            if _is_tiktok_host(parsed.netloc):
+                return candidate
+        return urls[0]
+
     if text.startswith("<") and text.endswith(">"):
         text = text[1:-1].strip()
     if text.startswith("http") and "|" in text:
@@ -1301,6 +1312,18 @@ def _normalize_input_link(value: str) -> str:
 def _is_tiktok_host(host: str) -> bool:
     host = str(host or "").lower()
     return host == "tiktok.com" or host.endswith(".tiktok.com")
+
+
+def _extract_urls_from_text(text: str) -> list[str]:
+    urls: list[str] = []
+    for raw in re.findall(r"https?://[^\s<>]+", str(text)):
+        candidate = raw.strip(" \t\r\n<>()[]{}.,;\"'")
+        if not candidate:
+            continue
+        if "|" in candidate:
+            candidate = candidate.split("|", 1)[0].strip()
+        urls.append(candidate)
+    return urls
 
 
 def _extract_item_id_from_text(text: str | None) -> str | None:
