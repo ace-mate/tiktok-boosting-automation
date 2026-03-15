@@ -213,7 +213,30 @@ class TikTokBoostAutomation:
 
         logging.info("Step 7/10: fetching ads for campaign %s", new_campaign_id)
         ads = self._get_entities_for_campaign("/ad/get/", new_campaign_id, "ads")
+        if not ads and adgroups:
+            logging.warning(
+                "Duplicated campaign %s has 0 ads after copy. Backfilling ads from source campaign %s.",
+                new_campaign_id,
+                source_campaign_id,
+            )
+            created_from_source = self._backfill_ads_from_source_campaign(
+                source_campaign_id=source_campaign_id,
+                target_adgroups=adgroups,
+                tiktok_item_id=latest_item_id,
+            )
+            logging.info("Backfill created %d ads from source campaign.", created_from_source)
+            ads = self._wait_for_ads_count(
+                campaign_id=str(new_campaign_id),
+                min_count=max(1, int(created_from_source)),
+                max_attempts=6,
+                sleep_seconds=3,
+            )
         logging.info("Found %d ads in duplicated campaign", len(ads))
+        if not ads:
+            raise RuntimeError(
+                "Duplicated campaign has no ads after copy/backfill. "
+                "Aborting to avoid launching an empty campaign."
+            )
 
         logging.info("Step 9/10: renaming ads and swapping creatives to latest post")
         updated_ad_ids = self._update_ads(ads, ad_name=date_tag, tiktok_item_id=latest_item_id)
@@ -222,6 +245,7 @@ class TikTokBoostAutomation:
             ad_name=date_tag,
             tiktok_item_id=latest_item_id,
         )
+        ads = self._get_entities_for_campaign("/ad/get/", str(new_campaign_id), "ads")
         if ad_alignment.get("mismatched_ad_ids"):
             logging.warning(
                 "Some ads are still mismatched after retries: %s",
@@ -702,6 +726,113 @@ class TikTokBoostAutomation:
             "creatives": [creative],
         }
         return payload
+
+    def _backfill_ads_from_source_campaign(
+        self,
+        source_campaign_id: str,
+        target_adgroups: list[dict[str, Any]],
+        tiktok_item_id: str,
+    ) -> int:
+        source_adgroups = self._get_entities_for_campaign("/adgroup/get/", source_campaign_id, "source_adgroups")
+        source_ads = self._get_source_ads_for_manual_copy(
+            source_campaign_id=source_campaign_id,
+            source_adgroups=source_adgroups,
+        )
+        if not source_ads:
+            raise RuntimeError(f"Source campaign {source_campaign_id} has no accessible ads to backfill.")
+
+        source_adgroups_by_id: dict[str, dict[str, Any]] = {}
+        for adgroup in source_adgroups:
+            adgroup_id = _pick_id(adgroup, ["adgroup_id", "id"])
+            if adgroup_id:
+                source_adgroups_by_id[str(adgroup_id)] = adgroup
+
+        # Primary mapping by adgroup_name; fallback to remaining target adgroups.
+        target_by_name: dict[str, list[str]] = {}
+        all_target_ids: list[str] = []
+        for target in target_adgroups:
+            target_id = _pick_id(target, ["adgroup_id", "id"])
+            if not target_id:
+                continue
+            all_target_ids.append(str(target_id))
+            name = str(target.get("adgroup_name") or "").strip()
+            target_by_name.setdefault(name, []).append(str(target_id))
+
+        if not all_target_ids:
+            raise RuntimeError("No target adgroups available for ad backfill.")
+
+        source_to_target: dict[str, str] = {}
+        used_targets: set[str] = set()
+        fallback_index = 0
+        for source in source_adgroups:
+            source_id = _pick_id(source, ["adgroup_id", "id"])
+            if not source_id:
+                continue
+            source_name = str(source.get("adgroup_name") or "").strip()
+
+            mapped_target = None
+            for candidate in target_by_name.get(source_name, []):
+                if candidate not in used_targets:
+                    mapped_target = candidate
+                    break
+
+            while mapped_target is None and fallback_index < len(all_target_ids):
+                candidate = all_target_ids[fallback_index]
+                fallback_index += 1
+                if candidate not in used_targets:
+                    mapped_target = candidate
+                    break
+
+            if mapped_target is None:
+                continue
+
+            source_to_target[str(source_id)] = mapped_target
+            used_targets.add(mapped_target)
+
+        created = 0
+        for source_ad in source_ads:
+            source_adgroup_id = _pick_id(source_ad, ["adgroup_id"])
+            if not source_adgroup_id:
+                continue
+
+            target_adgroup_id = source_to_target.get(str(source_adgroup_id))
+            if not target_adgroup_id and all_target_ids:
+                source_group = source_adgroups_by_id.get(str(source_adgroup_id), {})
+                source_name = str(source_group.get("adgroup_name") or "").strip()
+                for candidate in target_by_name.get(source_name, []):
+                    target_adgroup_id = candidate
+                    break
+            if not target_adgroup_id and all_target_ids:
+                target_adgroup_id = all_target_ids[0]
+            if not target_adgroup_id:
+                logging.warning("Skipping source ad without target adgroup mapping: %s", source_ad.get("ad_id"))
+                continue
+
+            payload = self._build_ad_create_payload(
+                source_ad=source_ad,
+                new_adgroup_id=str(target_adgroup_id),
+                tiktok_item_id=tiktok_item_id,
+            )
+            self.client.post("/ad/create/", payload)
+            created += 1
+
+        return created
+
+    def _wait_for_ads_count(
+        self,
+        campaign_id: str,
+        min_count: int,
+        max_attempts: int = 6,
+        sleep_seconds: int = 3,
+    ) -> list[dict[str, Any]]:
+        last_ads: list[dict[str, Any]] = []
+        for attempt in range(1, max_attempts + 1):
+            last_ads = self._get_entities_for_campaign("/ad/get/", campaign_id, "ads")
+            if len(last_ads) >= max(0, int(min_count)):
+                return last_ads
+            if attempt < max_attempts:
+                time.sleep(sleep_seconds)
+        return last_ads
 
     def _update_campaign(self, campaign_id: str, patch: dict[str, Any]) -> None:
         payload = {
