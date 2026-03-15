@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as dt
+import html
 import json
 import logging
 import os
@@ -1134,22 +1135,113 @@ def _build_campaign_manager_url(advertiser_id: str, campaign_id: str | None) -> 
 
 
 def _coerce_tiktok_item_id(value: str) -> str:
-    text = str(value).strip()
+    text = _normalize_input_link(value)
     if not text:
         raise RuntimeError("Empty TikTok item id override.")
 
-    match = re.search(r"/video/(\d+)", text)
-    if match:
-        return match.group(1)
+    extracted = _extract_item_id_from_text(text)
+    if extracted:
+        return extracted
 
     direct = re.fullmatch(r"\d+", text)
     if direct:
         return text
 
+    parsed = urllib.parse.urlparse(text)
+    is_url = parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    if is_url and _is_tiktok_host(parsed.netloc):
+        try:
+            resolved_url, response_text = _resolve_tiktok_url(text)
+        except RuntimeError as exc:
+            logging.warning("Could not resolve TikTok URL '%s': %s", text, exc)
+        else:
+            for candidate in (resolved_url, response_text):
+                extracted = _extract_item_id_from_text(candidate)
+                if extracted:
+                    return extracted
+
     raise RuntimeError(
         "Invalid --latest-item-id value. Provide a numeric item id or a TikTok video URL "
-        "(example: https://www.tiktok.com/@user/video/1234567890)."
+        "(example: https://www.tiktok.com/@user/video/1234567890). "
+        "Short links like https://vm.tiktok.com/... are supported."
     )
+
+
+def _normalize_input_link(value: str) -> str:
+    text = html.unescape(str(value).strip())
+    if text.startswith("<") and text.endswith(">"):
+        text = text[1:-1].strip()
+    if text.startswith("http") and "|" in text:
+        text = text.split("|", 1)[0].strip()
+    return text
+
+
+def _is_tiktok_host(host: str) -> bool:
+    host = str(host or "").lower()
+    return host == "tiktok.com" or host.endswith(".tiktok.com")
+
+
+def _extract_item_id_from_text(text: str | None) -> str | None:
+    if not text:
+        return None
+    raw = str(text)
+
+    patterns = [
+        r"/video/(\d+)",
+        r"/v/(\d+)\.html",
+        r'"itemId"\s*:\s*"(\d+)"',
+        r'"item_id"\s*:\s*"(\d+)"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw)
+        if match:
+            return match.group(1)
+
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme and parsed.netloc:
+        query = urllib.parse.parse_qs(parsed.query)
+        if parsed.fragment and "=" in parsed.fragment:
+            fragment_qs = urllib.parse.parse_qs(parsed.fragment)
+            for key, values in fragment_qs.items():
+                query.setdefault(key, values)
+        for key in ("item_id", "share_item_id", "video_id", "aweme_id", "group_id"):
+            values = query.get(key) or []
+            for value in values:
+                stripped = str(value).strip()
+                if stripped.isdigit():
+                    return stripped
+
+    return None
+
+
+def _resolve_tiktok_url(url: str, timeout_seconds: int = 20) -> tuple[str, str]:
+    request = urllib.request.Request(
+        url=url,
+        method="GET",
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            final_url = response.geturl()
+            body_bytes = response.read(512_000)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code}: {body[:200]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"network error: {exc}") from exc
+
+    try:
+        body = body_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        body = ""
+    return final_url, body
 
 
 def _post_slack_message(slack_token: str, channel_id: str, text: str) -> None:
