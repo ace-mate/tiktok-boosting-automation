@@ -444,7 +444,10 @@ class TikTokBoostAutomation:
             adgroup_id_map[str(source_adgroup_id)] = str(new_adgroup_id)
             logging.info("Created adgroup %s from source %s", new_adgroup_id, source_adgroup_id)
 
-        source_ads = self._get_entities_for_campaign("/ad/get/", source_campaign_id, "source_ads")
+        source_ads = self._get_source_ads_for_manual_copy(
+            source_campaign_id=source_campaign_id,
+            source_adgroups=source_adgroups,
+        )
         created_ads = 0
         for source_ad in source_ads:
             source_adgroup_id = _pick_id(source_ad, ["adgroup_id"])
@@ -469,6 +472,58 @@ class TikTokBoostAutomation:
             raise RuntimeError(f"Created {created_ads} ads but source campaign has {len(source_ads)} ads.")
 
         return new_campaign_id
+
+    def _get_source_ads_for_manual_copy(
+        self,
+        source_campaign_id: str,
+        source_adgroups: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        try:
+            return self._get_entities_for_campaign("/ad/get/", source_campaign_id, "source_ads")
+        except TikTokAPIError as exc:
+            lowered = str(exc).lower()
+            if "code=40002" not in lowered and "no permission to access this ad" not in lowered:
+                raise
+
+            logging.warning(
+                "Campaign-level /ad/get/ failed for source campaign %s due permissions (%s). "
+                "Retrying source ad fetch adgroup-by-adgroup.",
+                source_campaign_id,
+                exc,
+            )
+
+            collected: list[dict[str, Any]] = []
+            for source_adgroup in source_adgroups:
+                source_adgroup_id = _pick_id(source_adgroup, ["adgroup_id", "id"])
+                if not source_adgroup_id:
+                    continue
+                try:
+                    ads = self._get_entities_for_adgroup("/ad/get/", str(source_adgroup_id), "source_ads")
+                    if ads:
+                        logging.info("Loaded %d source ads from adgroup %s.", len(ads), source_adgroup_id)
+                    collected.extend(ads)
+                except TikTokAPIError as sub_exc:
+                    logging.warning(
+                        "Skipping source adgroup %s during ad fetch due API error: %s",
+                        source_adgroup_id,
+                        sub_exc,
+                    )
+
+            deduped: dict[str, dict[str, Any]] = {}
+            for ad in collected:
+                ad_id = _pick_id(ad, ["ad_id", "id"])
+                if not ad_id:
+                    continue
+                deduped[str(ad_id)] = ad
+
+            result = list(deduped.values())
+            if result:
+                return result
+
+            raise RuntimeError(
+                "Unable to read source ads due TikTok ad-level permission restrictions. "
+                "Try another source campaign or re-authorize broader Ads read access."
+            ) from exc
 
     def _build_campaign_create_payload(
         self, source_campaign: dict[str, Any], target_campaign_name: str
@@ -647,6 +702,19 @@ class TikTokBoostAutomation:
     def _get_entities_for_campaign(
         self, endpoint: str, campaign_id: str, entity_label: str
     ) -> list[dict[str, Any]]:
+        if endpoint in {"/ad/get/", "/adgroup/get/"}:
+            campaign_filtered = self._try_list_entities_filtered(
+                endpoint=endpoint,
+                filtering_candidates=[
+                    {"campaign_ids": [str(campaign_id)]},
+                    [{"field_name": "campaign_id", "filter_type": "IN", "filter_value": [str(campaign_id)]}],
+                    [{"field_name": "campaign_id", "filter_type": "IN", "filter_value": str(campaign_id)}],
+                ],
+            )
+            if campaign_filtered is not None:
+                filtered = [e for e in campaign_filtered if str(e.get("campaign_id")) == str(campaign_id)]
+                return filtered if filtered else campaign_filtered
+
         entities = self._list_entities(endpoint)
         filtered = [e for e in entities if str(e.get("campaign_id")) == str(campaign_id)]
         if not filtered:
@@ -658,6 +726,56 @@ class TikTokBoostAutomation:
                 entity_label,
             )
         return filtered
+
+    def _get_entities_for_adgroup(
+        self, endpoint: str, adgroup_id: str, entity_label: str
+    ) -> list[dict[str, Any]]:
+        if endpoint == "/ad/get/":
+            adgroup_filtered = self._try_list_entities_filtered(
+                endpoint=endpoint,
+                filtering_candidates=[
+                    {"adgroup_ids": [str(adgroup_id)]},
+                    [{"field_name": "adgroup_id", "filter_type": "IN", "filter_value": [str(adgroup_id)]}],
+                    [{"field_name": "adgroup_id", "filter_type": "IN", "filter_value": str(adgroup_id)}],
+                ],
+            )
+            if adgroup_filtered is not None:
+                filtered = [e for e in adgroup_filtered if str(e.get("adgroup_id")) == str(adgroup_id)]
+                return filtered if filtered else adgroup_filtered
+
+        entities = self._list_entities(endpoint)
+        filtered = [e for e in entities if str(e.get("adgroup_id")) == str(adgroup_id)]
+        if not filtered:
+            logging.warning(
+                "No %s matched adgroup_id=%s. Endpoint returned %d total %s.",
+                entity_label,
+                adgroup_id,
+                len(entities),
+                entity_label,
+            )
+        return filtered
+
+    def _try_list_entities_filtered(
+        self,
+        endpoint: str,
+        filtering_candidates: list[Any],
+    ) -> list[dict[str, Any]] | None:
+        for candidate in filtering_candidates:
+            params = {
+                "advertiser_id": self.config.advertiser_id,
+                "filtering": json.dumps(candidate, separators=(",", ":")),
+            }
+            try:
+                return self._list_entities_with_params(endpoint, params)
+            except TikTokAPIError as exc:
+                logging.debug(
+                    "Filtered %s lookup failed for candidate %s: %s",
+                    endpoint,
+                    candidate,
+                    exc,
+                )
+                continue
+        return None
 
     def _clear_adgroup_bids(self, adgroups: list[dict[str, Any]]) -> list[str]:
         cleared: list[str] = []
@@ -865,8 +983,12 @@ class TikTokBoostAutomation:
         )
 
     def _list_entities(self, endpoint: str) -> list[dict[str, Any]]:
-        base_params = {"advertiser_id": self.config.advertiser_id}
+        return self._list_entities_with_params(
+            endpoint=endpoint,
+            base_params={"advertiser_id": self.config.advertiser_id},
+        )
 
+    def _list_entities_with_params(self, endpoint: str, base_params: dict[str, Any]) -> list[dict[str, Any]]:
         try:
             first_page = self.client.get(endpoint, {**base_params, "page": 1, "page_size": 100})
             used_pagination = True
