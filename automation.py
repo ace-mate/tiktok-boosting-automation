@@ -478,12 +478,15 @@ class TikTokBoostAutomation:
         source_campaign_id: str,
         source_adgroups: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        initial_ads: list[dict[str, Any]] = []
+        root_exc: Exception | None = None
         try:
-            return self._get_entities_for_campaign("/ad/get/", source_campaign_id, "source_ads")
+            initial_ads = self._get_entities_for_campaign("/ad/get/", source_campaign_id, "source_ads")
         except TikTokAPIError as exc:
             lowered = str(exc).lower()
             if "code=40002" not in lowered and "no permission to access this ad" not in lowered:
                 raise
+            root_exc = exc
 
             logging.warning(
                 "Campaign-level /ad/get/ failed for source campaign %s due permissions (%s). "
@@ -491,39 +494,48 @@ class TikTokBoostAutomation:
                 source_campaign_id,
                 exc,
             )
+        else:
+            if initial_ads:
+                return initial_ads
+            logging.warning(
+                "Campaign-level /ad/get/ returned 0 ads for source campaign %s. "
+                "Retrying source ad fetch adgroup-by-adgroup.",
+                source_campaign_id,
+            )
+            root_exc = RuntimeError("campaign-level /ad/get/ returned no source ads")
 
-            collected: list[dict[str, Any]] = []
-            for source_adgroup in source_adgroups:
-                source_adgroup_id = _pick_id(source_adgroup, ["adgroup_id", "id"])
-                if not source_adgroup_id:
-                    continue
-                try:
-                    ads = self._get_entities_for_adgroup("/ad/get/", str(source_adgroup_id), "source_ads")
-                    if ads:
-                        logging.info("Loaded %d source ads from adgroup %s.", len(ads), source_adgroup_id)
-                    collected.extend(ads)
-                except TikTokAPIError as sub_exc:
-                    logging.warning(
-                        "Skipping source adgroup %s during ad fetch due API error: %s",
-                        source_adgroup_id,
-                        sub_exc,
-                    )
+        collected: list[dict[str, Any]] = []
+        for source_adgroup in source_adgroups:
+            source_adgroup_id = _pick_id(source_adgroup, ["adgroup_id", "id"])
+            if not source_adgroup_id:
+                continue
+            try:
+                ads = self._get_entities_for_adgroup("/ad/get/", str(source_adgroup_id), "source_ads")
+                if ads:
+                    logging.info("Loaded %d source ads from adgroup %s.", len(ads), source_adgroup_id)
+                collected.extend(ads)
+            except TikTokAPIError as sub_exc:
+                logging.warning(
+                    "Skipping source adgroup %s during ad fetch due API error: %s",
+                    source_adgroup_id,
+                    sub_exc,
+                )
 
-            deduped: dict[str, dict[str, Any]] = {}
-            for ad in collected:
-                ad_id = _pick_id(ad, ["ad_id", "id"])
-                if not ad_id:
-                    continue
-                deduped[str(ad_id)] = ad
+        deduped: dict[str, dict[str, Any]] = {}
+        for ad in collected:
+            ad_id = _pick_id(ad, ["ad_id", "id"])
+            if not ad_id:
+                continue
+            deduped[str(ad_id)] = ad
 
-            result = list(deduped.values())
-            if result:
-                return result
+        result = list(deduped.values())
+        if result:
+            return result
 
-            raise RuntimeError(
-                "Unable to read source ads due TikTok ad-level permission restrictions. "
-                "Try another source campaign or re-authorize broader Ads read access."
-            ) from exc
+        raise RuntimeError(
+            "Unable to read source ads for the source campaign. "
+            "TikTok returned no accessible ads in both campaign and adgroup fetch paths."
+        ) from root_exc
 
     def _build_campaign_create_payload(
         self, source_campaign: dict[str, Any], target_campaign_name: str
