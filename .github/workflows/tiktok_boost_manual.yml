@@ -7,9 +7,15 @@ on:
         description: TikTok video URL to boost (or numeric item_id)
         required: true
         type: string
+      access_token:
+        description: TikTok access token (recommended; overrides oauth_url if set)
+        required: false
+        default: ""
+        type: string
       oauth_url:
-        description: TikTok OAuth callback URL that contains auth_code/code
-        required: true
+        description: TikTok OAuth callback URL that contains auth_code/code (used only if access_token is empty)
+        required: false
+        default: ""
         type: string
       source_campaign_name:
         description: Exact campaign name to copy
@@ -52,6 +58,7 @@ jobs:
 
       - name: Parse OAuth URL
         id: oauth
+        if: ${{ inputs.access_token == '' }}
         shell: bash
         env:
           INPUT_OAUTH_URL: ${{ inputs.oauth_url }}
@@ -98,8 +105,31 @@ jobs:
               fh.write(f"auth_code={auth_code}\n")
           PY
 
+      - name: Use provided access token
+        id: token_direct
+        if: ${{ inputs.access_token != '' }}
+        shell: bash
+        env:
+          INPUT_ACCESS_TOKEN: ${{ inputs.access_token }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+
+          access_token = str(os.environ.get("INPUT_ACCESS_TOKEN") or "").strip()
+          if not access_token:
+              print("::error::access_token input is empty.")
+              sys.exit(1)
+
+          print(f"::add-mask::{access_token}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"access_token={access_token}\n")
+          print("Using access_token input directly.")
+          PY
+
       - name: Exchange auth_code for access_token
         id: token
+        if: ${{ inputs.access_token == '' }}
         shell: bash
         env:
           TIKTOK_APP_SECRET: ${{ secrets.TIKTOK_APP_SECRET }}
@@ -152,6 +182,29 @@ jobs:
               fh.write(f"access_token={access_token}\n")
           PY
 
+      - name: Resolve final access token
+        id: token_final
+        shell: bash
+        env:
+          TOKEN_DIRECT: ${{ steps.token_direct.outputs.access_token }}
+          TOKEN_EXCHANGED: ${{ steps.token.outputs.access_token }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+
+          token = str(os.environ.get("TOKEN_DIRECT") or "").strip()
+          if not token:
+              token = str(os.environ.get("TOKEN_EXCHANGED") or "").strip()
+          if not token:
+              print("::error::No access token available. Provide access_token input or a valid oauth_url callback.")
+              sys.exit(1)
+
+          print(f"::add-mask::{token}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"access_token={token}\n")
+          PY
+
       - name: Resolve date tag
         id: date
         shell: bash
@@ -168,7 +221,7 @@ jobs:
         id: run_automation
         shell: bash
         env:
-          TIKTOK_ACCESS_TOKEN: ${{ steps.token.outputs.access_token }}
+          TIKTOK_ACCESS_TOKEN: ${{ steps.token_final.outputs.access_token }}
           TIKTOK_ADVERTISER_ID: ${{ env.TIKTOK_ADVERTISER_ID }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: C0A49B277UK
@@ -216,7 +269,7 @@ jobs:
         env:
           CAMPAIGN_ID: ${{ steps.result.outputs.campaign_id }}
           CAMPAIGN_NAME: ${{ steps.result.outputs.campaign_name }}
-          TIKTOK_ACCESS_TOKEN: ${{ steps.token.outputs.access_token }}
+          TIKTOK_ACCESS_TOKEN: ${{ steps.token_final.outputs.access_token }}
           SPEND_LIMIT_EUR: ${{ inputs.spend_limit_eur }}
         run: |
           python - <<'PY'
@@ -254,8 +307,10 @@ jobs:
           SLACK_CHANNEL_ID: C0A49B277UK
           INPUT_VIDEO_LINK: ${{ inputs.video_link }}
           DATE_TAG: ${{ steps.date.outputs.date_tag }}
+          OUTCOME_DIRECT_TOKEN: ${{ steps.token_direct.outcome }}
           OUTCOME_OAUTH: ${{ steps.oauth.outcome }}
           OUTCOME_TOKEN: ${{ steps.token.outcome }}
+          OUTCOME_TOKEN_FINAL: ${{ steps.token_final.outcome }}
           OUTCOME_DATE: ${{ steps.date.outcome }}
           OUTCOME_RUN: ${{ steps.run_automation.outcome }}
           OUTCOME_RESULT: ${{ steps.result.outcome }}
@@ -274,8 +329,10 @@ jobs:
               raise SystemExit(0)
 
           outcomes = [
+              ("Use provided access token", os.environ.get("OUTCOME_DIRECT_TOKEN", "")),
               ("Parse OAuth URL", os.environ.get("OUTCOME_OAUTH", "")),
               ("Exchange auth_code for access_token", os.environ.get("OUTCOME_TOKEN", "")),
+              ("Resolve final access token", os.environ.get("OUTCOME_TOKEN_FINAL", "")),
               ("Resolve date tag", os.environ.get("OUTCOME_DATE", "")),
               ("Run automation", os.environ.get("OUTCOME_RUN", "")),
               ("Parse run result", os.environ.get("OUTCOME_RESULT", "")),
