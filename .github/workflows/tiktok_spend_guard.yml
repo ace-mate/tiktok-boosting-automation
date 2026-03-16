@@ -4,6 +4,17 @@ on:
   schedule:
     - cron: "0 * * * *"
   workflow_dispatch:
+    inputs:
+      campaign_name_contains:
+        description: Case-insensitive campaign name filter
+        required: false
+        default: Views
+        type: string
+      spend_limit_eur:
+        description: Disable campaigns with spend >= this EUR amount (today, UTC)
+        required: false
+        default: "10"
+        type: string
 
 permissions:
   contents: read
@@ -11,6 +22,7 @@ permissions:
 
 env:
   TIKTOK_BASE_URL: https://business-api.tiktok.com/open_api/v1.3
+  TIKTOK_ADVERTISER_ID: "7441895227339718673"
   MONITOR_ARTIFACT_NAME: tiktok-monitor-state
 
 jobs:
@@ -18,14 +30,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Load latest monitor state artifact
+      - name: Load latest monitor artifact token (fallback)
         id: state
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           python - <<'PY'
-          import datetime as dt
           import io
           import json
           import os
@@ -52,26 +63,23 @@ jobs:
 
           artifacts = payload.get("artifacts") or []
           artifacts = [a for a in artifacts if isinstance(a, dict) and not a.get("expired")]
-
           if not artifacts:
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-                  out.write("action=none\n")
+                  out.write("token=\n")
               print("No monitor state artifact found.")
               raise SystemExit(0)
 
           artifacts.sort(key=lambda a: str(a.get("created_at") or ""), reverse=True)
           artifact = artifacts[0]
-          artifact_id = str(artifact.get("id"))
           archive_url = str(artifact.get("archive_download_url") or "").strip()
           if not archive_url:
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-                  out.write("action=none\n")
+                  out.write("token=\n")
               print("Latest monitor artifact has no archive_download_url.")
               raise SystemExit(0)
 
           req = urllib.request.Request(archive_url, method="GET", headers=headers)
           zip_bytes = urllib.request.urlopen(req, timeout=30).read()
-
           with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
               names = zf.namelist()
               target = "monitor_state.json"
@@ -82,69 +90,59 @@ jobs:
                       raise RuntimeError(f"monitor_state.json not found in artifact files: {names}")
               state = json.loads(zf.read(target).decode("utf-8"))
 
-          campaign_id = str(state.get("campaign_id") or "").strip()
-          advertiser_id = str(state.get("advertiser_id") or "").strip()
-          access_token = str(state.get("access_token") or "").strip()
-          started_at_raw = str(state.get("started_at") or "").strip()
-          spend_limit_raw = str(state.get("spend_limit_eur") or "10").strip()
-
-          if not campaign_id or not advertiser_id or not access_token or not started_at_raw:
-              raise RuntimeError(f"Invalid monitor state payload: {state}")
-
-          started_at = dt.datetime.fromisoformat(started_at_raw.replace("Z", "+00:00"))
-          if started_at.tzinfo is None:
-              started_at = started_at.replace(tzinfo=dt.timezone.utc)
-
-          now = dt.datetime.now(dt.timezone.utc)
-          age_hours = (now - started_at).total_seconds() / 3600.0
-
-          if age_hours < 6:
-              action = "wait"
-          elif age_hours > 30:
-              action = "stale"
-          else:
-              action = "check"
-
-          try:
-              spend_limit_eur = float(spend_limit_raw)
-          except ValueError:
-              spend_limit_eur = 10.0
-
-          print(f"::add-mask::{access_token}")
-
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as envf:
-              envf.write(f"MONITOR_CAMPAIGN_ID={campaign_id}\n")
-              envf.write(f"MONITOR_ADVERTISER_ID={advertiser_id}\n")
-              envf.write(f"MONITOR_ACCESS_TOKEN={access_token}\n")
-              envf.write(f"MONITOR_STARTED_AT={started_at.isoformat()}\n")
-              envf.write(f"MONITOR_SPEND_LIMIT_EUR={spend_limit_eur}\n")
-
+          token_value = str(state.get("access_token") or "").strip()
+          print(f"::add-mask::{token_value}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write(f"action={action}\n")
-              out.write(f"age_hours={age_hours:.3f}\n")
-              out.write(f"artifact_id={artifact_id}\n")
-
-          print(
-              f"Loaded monitor artifact id={artifact_id} for campaign {campaign_id}; "
-              f"age={age_hours:.2f}h; action={action}"
-          )
+              out.write(f"token={token_value}\n")
           PY
 
-      - name: Nothing to check
-        if: steps.state.outputs.action == 'none'
-        run: echo "No active monitor state artifact."
+      - name: Resolve guard context
+        id: ctx
+        shell: bash
+        env:
+          TOKEN_FROM_SECRET: ${{ secrets.TIKTOK_ACCESS_TOKEN }}
+          TOKEN_FROM_ARTIFACT: ${{ steps.state.outputs.token }}
+          INPUT_NAME_FILTER: ${{ inputs.campaign_name_contains }}
+          INPUT_SPEND_LIMIT: ${{ inputs.spend_limit_eur }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
 
-      - name: Warm-up period not reached
-        if: steps.state.outputs.action == 'wait'
-        run: echo "Skipping spend check; less than 6 hours since campaign launch (age=${{ steps.state.outputs.age_hours }}h)."
+          token = str(os.environ.get("TOKEN_FROM_SECRET") or "").strip()
+          if token:
+              token_source = "secret"
+          else:
+              token = str(os.environ.get("TOKEN_FROM_ARTIFACT") or "").strip()
+              token_source = "artifact"
 
-      - name: Monitor state stale
-        if: steps.state.outputs.action == 'stale'
-        run: echo "Latest monitor artifact is stale (>30h). Skipping."
+          if not token:
+              print(
+                  "::error::No TikTok token available for spend guard. "
+                  "Set secret TIKTOK_ACCESS_TOKEN or run TikTok Boost Manual first to publish monitor artifact."
+              )
+              sys.exit(1)
 
-      - name: Fetch campaign spend
-        id: spend
-        if: steps.state.outputs.action == 'check'
+          try:
+              spend_limit = float(str(os.environ.get("INPUT_SPEND_LIMIT") or "10").strip())
+          except ValueError:
+              spend_limit = 10.0
+          if spend_limit <= 0:
+              spend_limit = 10.0
+
+          name_filter = str(os.environ.get("INPUT_NAME_FILTER") or "Views").strip() or "Views"
+          print(f"Resolved spend guard context: token_source={token_source}, name_filter={name_filter}, spend_limit={spend_limit:.2f}")
+          print(f"::add-mask::{token}")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as envf:
+              envf.write(f"GUARD_ACCESS_TOKEN={token}\n")
+              envf.write(f"GUARD_SPEND_LIMIT_EUR={spend_limit}\n")
+              envf.write(f"GUARD_NAME_FILTER={name_filter}\n")
+              envf.write(f"GUARD_TOKEN_SOURCE={token_source}\n")
+          PY
+
+      - name: Disable over-budget active Views campaigns
+        id: guard
         shell: bash
         run: |
           python - <<'PY'
@@ -154,133 +152,268 @@ jobs:
           import urllib.parse
           import urllib.request
 
-          def _to_float(value):
+          base_url = os.environ["TIKTOK_BASE_URL"].rstrip("/")
+          advertiser_id = str(os.environ["TIKTOK_ADVERTISER_ID"]).strip()
+          access_token = str(os.environ["GUARD_ACCESS_TOKEN"]).strip()
+          name_filter = str(os.environ.get("GUARD_NAME_FILTER") or "Views").strip().lower()
+          spend_limit = float(str(os.environ.get("GUARD_SPEND_LIMIT_EUR") or "10"))
+
+          def api_get(path, params):
+              url = f"{base_url}{path}?{urllib.parse.urlencode(params)}"
+              req = urllib.request.Request(
+                  url=url,
+                  method="GET",
+                  headers={
+                      "Access-Token": access_token,
+                      "Authorization": f"Bearer {access_token}",
+                      "Content-Type": "application/json",
+                  },
+              )
+              body = json.loads(urllib.request.urlopen(req, timeout=30).read().decode("utf-8"))
+              if body.get("code") not in (0, "0", None):
+                  raise RuntimeError(f"GET {path} failed: code={body.get('code')} message={body.get('message')} body={body}")
+              return body.get("data") or {}
+
+          def api_post(path, payload):
+              req = urllib.request.Request(
+                  url=f"{base_url}{path}",
+                  method="POST",
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={
+                      "Access-Token": access_token,
+                      "Authorization": f"Bearer {access_token}",
+                      "Content-Type": "application/json",
+                  },
+              )
+              body = json.loads(urllib.request.urlopen(req, timeout=30).read().decode("utf-8"))
+              if body.get("code") not in (0, "0", None):
+                  raise RuntimeError(f"POST {path} failed: code={body.get('code')} message={body.get('message')} body={body}")
+              return body.get("data") or {}
+
+          def extract_list(data):
+              if isinstance(data, list):
+                  return data
+              if isinstance(data, dict):
+                  for key in ("list", "campaigns", "data", "results", "rows"):
+                      value = data.get(key)
+                      if isinstance(value, list):
+                          return value
+              return []
+
+          def to_float(value):
               try:
                   return float(value)
               except (TypeError, ValueError):
                   return 0.0
 
-          def _row_spend(row):
-              if not isinstance(row, dict):
-                  return 0.0
-              direct = _to_float(row.get("spend"))
-              if direct > 0:
-                  return direct
-              metrics = row.get("metrics")
-              if isinstance(metrics, dict):
-                  metric_spend = _to_float(metrics.get("spend"))
-                  if metric_spend > 0:
-                      return metric_spend
-              return 0.0
-
-          base_url = os.environ["TIKTOK_BASE_URL"].rstrip("/")
-          advertiser_id = os.environ["MONITOR_ADVERTISER_ID"]
-          campaign_id = os.environ["MONITOR_CAMPAIGN_ID"]
-          access_token = os.environ["MONITOR_ACCESS_TOKEN"]
-          spend_limit = _to_float(os.environ.get("MONITOR_SPEND_LIMIT_EUR", "10"))
-
-          now = dt.datetime.now(dt.timezone.utc).date()
-          start_date = dt.datetime.fromisoformat(os.environ["MONITOR_STARTED_AT"].replace("Z", "+00:00")).date()
-
-          params = {
-              "advertiser_id": advertiser_id,
-              "report_type": "BASIC",
-              "data_level": "AUCTION_CAMPAIGN",
-              "dimensions": json.dumps(["campaign_id"]),
-              "metrics": json.dumps(["spend"]),
-              "start_date": start_date.isoformat(),
-              "end_date": now.isoformat(),
-              "page": "1",
-              "page_size": "100",
-              "filtering": json.dumps([
+          # 1) Fetch campaigns with pagination.
+          campaigns = []
+          page = 1
+          while True:
+              data = api_get(
+                  "/campaign/get/",
                   {
-                      "field_name": "campaign_id",
-                      "filter_type": "IN",
-                      "filter_value": campaign_id,
-                  }
-              ]),
+                      "advertiser_id": advertiser_id,
+                      "page": page,
+                      "page_size": 100,
+                  },
+              )
+              items = extract_list(data)
+              if not items:
+                  break
+              campaigns.extend(items)
+              if len(items) < 100:
+                  break
+              page += 1
+
+          def is_active(c):
+              op = str(c.get("operation_status") or "").upper()
+              sec = str(c.get("secondary_status") or "").upper()
+              if op == "ENABLE":
+                  return True
+              return ("ENABLE" in sec) and ("DISABLE" not in sec)
+
+          candidates = []
+          for c in campaigns:
+              name = str(c.get("campaign_name") or c.get("name") or "").strip()
+              cid = str(c.get("campaign_id") or c.get("id") or "").strip()
+              if not cid or not name:
+                  continue
+              if name_filter not in name.lower():
+                  continue
+              if not is_active(c):
+                  continue
+              candidates.append({"campaign_id": cid, "campaign_name": name})
+
+          # 2) Reporting spend (today UTC).
+          today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+          spend_map = {c["campaign_id"]: 0.0 for c in candidates}
+
+          chunk_size = 50
+          campaign_ids = [c["campaign_id"] for c in candidates]
+          for i in range(0, len(campaign_ids), chunk_size):
+              chunk = campaign_ids[i:i + chunk_size]
+              data = api_get(
+                  "/report/integrated/get/",
+                  {
+                      "advertiser_id": advertiser_id,
+                      "report_type": "BASIC",
+                      "data_level": "AUCTION_CAMPAIGN",
+                      "dimensions": json.dumps(["campaign_id"], separators=(",", ":")),
+                      "metrics": json.dumps(["spend"], separators=(",", ":")),
+                      "start_date": today,
+                      "end_date": today,
+                      "page": "1",
+                      "page_size": "200",
+                      "filtering": json.dumps(
+                          [
+                              {
+                                  "field_name": "campaign_id",
+                                  "filter_type": "IN",
+                                  "filter_value": chunk,
+                              }
+                          ],
+                          separators=(",", ":"),
+                      ),
+                  },
+              )
+              rows = extract_list(data)
+              for row in rows:
+                  if not isinstance(row, dict):
+                      continue
+                  cid = str(row.get("campaign_id") or "").strip()
+                  if not cid:
+                      continue
+                  spend = to_float(row.get("spend"))
+                  metrics = row.get("metrics")
+                  if spend <= 0 and isinstance(metrics, dict):
+                      spend = to_float(metrics.get("spend"))
+                  spend_map[cid] = max(spend_map.get(cid, 0.0), spend)
+
+          disable_items = []
+          for c in candidates:
+              cid = c["campaign_id"]
+              spend = spend_map.get(cid, 0.0)
+              if spend >= spend_limit:
+                  disable_items.append(
+                      {
+                          "campaign_id": cid,
+                          "campaign_name": c["campaign_name"],
+                          "spend_eur": round(spend, 4),
+                      }
+                  )
+
+          if disable_items:
+              api_post(
+                  "/campaign/status/update/",
+                  {
+                      "advertiser_id": advertiser_id,
+                      "campaign_ids": [x["campaign_id"] for x in disable_items],
+                      "operation_status": "DISABLE",
+                      "allow_partial_success": True,
+                  },
+              )
+
+          result = {
+              "name_filter": name_filter,
+              "spend_limit_eur": spend_limit,
+              "checked_active_views_campaigns": len(candidates),
+              "disabled_campaigns_count": len(disable_items),
+              "disabled_campaigns": disable_items,
+              "token_source": os.environ.get("GUARD_TOKEN_SOURCE", "unknown"),
+              "date_utc": today,
           }
 
-          url = f"{base_url}/report/integrated/get/?{urllib.parse.urlencode(params)}"
-          req = urllib.request.Request(
-              url,
-              method="GET",
-              headers={
-                  "Access-Token": access_token,
-                  "Authorization": f"Bearer {access_token}",
-                  "Content-Type": "application/json",
-              },
-          )
-
-          raw = urllib.request.urlopen(req, timeout=30).read().decode("utf-8")
-          body = json.loads(raw)
-
-          if body.get("code") not in (0, "0", None):
-              raise RuntimeError(f"TikTok report error: code={body.get('code')} message={body.get('message')} body={body}")
-
-          data = body.get("data")
-          if isinstance(data, dict):
-              rows = data.get("list") or data.get("rows") or []
-          elif isinstance(data, list):
-              rows = data
-          else:
-              rows = []
-
-          spend = 0.0
-          for row in rows:
-              if isinstance(row, dict):
-                  row_campaign_id = str(row.get("campaign_id") or "").strip()
-                  if row_campaign_id and row_campaign_id != campaign_id:
-                      continue
-              spend += _row_spend(row)
-
-          should_stop = spend >= spend_limit
+          with open("guard_result.json", "w", encoding="utf-8") as fh:
+              json.dump(result, fh)
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write(f"spend_eur={spend:.4f}\n")
-              out.write(f"should_stop={'true' if should_stop else 'false'}\n")
+              out.write(f"checked_count={len(candidates)}\n")
+              out.write(f"disabled_count={len(disable_items)}\n")
 
-          print(f"Campaign spend={spend:.4f} EUR, limit={spend_limit:.4f} EUR, should_stop={should_stop}")
+          print(json.dumps(result, indent=2))
           PY
 
-      - name: Disable campaign at spend threshold
-        id: disable_campaign
-        if: steps.state.outputs.action == 'check' && steps.spend.outputs.should_stop == 'true'
+      - name: Send Slack summary
+        if: success()
+        continue-on-error: true
         shell: bash
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: C0A49B277UK
+          CHECKED_COUNT: ${{ steps.guard.outputs.checked_count }}
+          DISABLED_COUNT: ${{ steps.guard.outputs.disabled_count }}
         run: |
           python - <<'PY'
           import json
           import os
+          import urllib.error
           import urllib.request
 
-          base_url = os.environ["TIKTOK_BASE_URL"].rstrip("/")
-          advertiser_id = os.environ["MONITOR_ADVERTISER_ID"]
-          campaign_id = os.environ["MONITOR_CAMPAIGN_ID"]
-          access_token = os.environ["MONITOR_ACCESS_TOKEN"]
+          token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+          if not token:
+              print("SLACK_BOT_TOKEN not set; skipping Slack summary notification.")
+              raise SystemExit(0)
+
+          try:
+              with open("guard_result.json", "r", encoding="utf-8") as fh:
+                  result = json.load(fh)
+          except Exception:
+              result = {}
+
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          run_id = os.environ.get("GITHUB_RUN_ID", "")
+          run_url = f"https://github.com/{repo}/actions/runs/{run_id}" if repo and run_id else ""
+
+          disabled = result.get("disabled_campaigns") or []
+          if disabled:
+              lines = "\n".join(
+                  f"- {c.get('campaign_name')} ({c.get('campaign_id')}): €{c.get('spend_eur')}"
+                  for c in disabled
+              )
+          else:
+              lines = "- none"
+
+          text = (
+              "TikTok Spend Guard Completed\n"
+              f"Checked active \"Views\" campaigns: {os.environ.get('CHECKED_COUNT', '0')}\n"
+              f"Disabled over-budget campaigns: {os.environ.get('DISABLED_COUNT', '0')}\n"
+              f"Limit (EUR, today UTC): {result.get('spend_limit_eur', '10')}\n"
+              f"Disabled list:\n{lines}\n"
+              f"Run: {run_url}"
+          )
 
           payload = {
-              "advertiser_id": advertiser_id,
-              "campaign_ids": [campaign_id],
-              "operation_status": "DISABLE",
+              "channel": os.environ.get("SLACK_CHANNEL_ID", "C0A49B277UK"),
+              "text": text,
+              "unfurl_links": False,
+              "unfurl_media": False,
           }
 
           req = urllib.request.Request(
-              url=f"{base_url}/campaign/status/update/",
+              url="https://slack.com/api/chat.postMessage",
               method="POST",
               data=json.dumps(payload).encode("utf-8"),
               headers={
-                  "Access-Token": access_token,
-                  "Authorization": f"Bearer {access_token}",
-                  "Content-Type": "application/json",
+                  "Authorization": f"Bearer {token}",
+                  "Content-Type": "application/json; charset=utf-8",
               },
           )
+          try:
+              raw = urllib.request.urlopen(req, timeout=20).read().decode("utf-8")
+          except urllib.error.HTTPError as exc:
+              body = exc.read().decode("utf-8", errors="replace")
+              print(f"Slack summary failed with HTTP {exc.code}: {body}")
+              raise SystemExit(0)
+          except urllib.error.URLError as exc:
+              print(f"Slack summary network error: {exc}")
+              raise SystemExit(0)
 
-          raw = urllib.request.urlopen(req, timeout=30).read().decode("utf-8")
-          body = json.loads(raw)
-          if body.get("code") not in (0, "0", None):
-              raise RuntimeError(f"Disable failed: {body}")
-
-          print(f"Campaign {campaign_id} disabled after crossing spend limit.")
+          parsed = json.loads(raw)
+          if not parsed.get("ok"):
+              print(f"Slack API returned error for summary message: {parsed}")
+          else:
+              print("Slack summary notification sent.")
           PY
 
       - name: Send Slack error notification
@@ -291,8 +424,8 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: C0A49B277UK
           OUTCOME_STATE: ${{ steps.state.outcome }}
-          OUTCOME_SPEND: ${{ steps.spend.outcome }}
-          OUTCOME_DISABLE: ${{ steps.disable_campaign.outcome }}
+          OUTCOME_CTX: ${{ steps.ctx.outcome }}
+          OUTCOME_GUARD: ${{ steps.guard.outcome }}
         run: |
           python - <<'PY'
           import json
@@ -306,9 +439,9 @@ jobs:
               raise SystemExit(0)
 
           outcomes = [
-              ("Load latest monitor state artifact", os.environ.get("OUTCOME_STATE", "")),
-              ("Fetch campaign spend", os.environ.get("OUTCOME_SPEND", "")),
-              ("Disable campaign at spend threshold", os.environ.get("OUTCOME_DISABLE", "")),
+              ("Load latest monitor artifact token", os.environ.get("OUTCOME_STATE", "")),
+              ("Resolve guard context", os.environ.get("OUTCOME_CTX", "")),
+              ("Disable over-budget active Views campaigns", os.environ.get("OUTCOME_GUARD", "")),
           ]
           failed_step = next((name for name, outcome in outcomes if outcome == "failure"), "Unknown")
 
@@ -344,15 +477,15 @@ jobs:
               raw = urllib.request.urlopen(req, timeout=20).read().decode("utf-8")
           except urllib.error.HTTPError as exc:
               body = exc.read().decode("utf-8", errors="replace")
-              print(f"Slack notification failed with HTTP {exc.code}: {body}")
+              print(f"Slack failure-notification failed with HTTP {exc.code}: {body}")
               raise SystemExit(0)
           except urllib.error.URLError as exc:
-              print(f"Slack notification network error: {exc}")
+              print(f"Slack failure-notification network error: {exc}")
               raise SystemExit(0)
 
-          result = json.loads(raw)
-          if not result.get("ok"):
-              print(f"Slack API returned error: {result}")
+          parsed = json.loads(raw)
+          if not parsed.get("ok"):
+              print(f"Slack API returned error for failure message: {parsed}")
           else:
               print("Slack failure notification sent.")
           PY
