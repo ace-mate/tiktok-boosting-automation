@@ -45,11 +45,27 @@ jobs:
             exit 0
           fi
 
-          artifact_id="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${MONITOR_ARTIFACT_NAME}&per_page=100" | python - <<'PY'
+          artifact_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${MONITOR_ARTIFACT_NAME}&per_page=100" 2>/tmp/guard_artifact_err.log || true)"
+          if [ -z "${artifact_json}" ]; then
+            echo "token=" >> "$GITHUB_OUTPUT"
+            echo "Artifact list fetch returned no data; continuing without artifact token."
+            exit 0
+          fi
+
+          artifact_id="$(printf '%s' "${artifact_json}" | python - <<'PY'
           import json
           import sys
 
-          payload = json.load(sys.stdin)
+          raw = sys.stdin.read()
+          if not raw.strip():
+              print("")
+              raise SystemExit(0)
+          try:
+              payload = json.loads(raw)
+          except json.JSONDecodeError:
+              print("")
+              raise SystemExit(0)
+
           artifacts = payload.get("artifacts") or []
           artifacts = [a for a in artifacts if isinstance(a, dict) and not a.get("expired")]
           artifacts.sort(key=lambda a: str(a.get("created_at") or ""), reverse=True)
