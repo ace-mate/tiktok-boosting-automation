@@ -59,11 +59,11 @@ jobs:
             exit 0
           fi
 
-          artifact_id="$(printf '%s' "${artifact_json}" | python - <<'PY'
+          artifact_id="$(ARTIFACT_JSON="${artifact_json}" python - <<'PY'
           import json
-          import sys
+          import os
 
-          raw = sys.stdin.read()
+          raw = os.environ.get("ARTIFACT_JSON", "")
           if not raw.strip():
               print("")
               raise SystemExit(0)
