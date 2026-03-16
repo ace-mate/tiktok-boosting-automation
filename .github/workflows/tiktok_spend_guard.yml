@@ -6,12 +6,12 @@ on:
   workflow_dispatch:
     inputs:
       campaign_name_contains:
-        description: Case-insensitive campaign name filter
+        description: Case-insensitive campaign-name filter
         required: false
         default: Views
         type: string
       spend_limit_eur:
-        description: Disable campaigns with spend >= this EUR amount (today, UTC)
+        description: Disable campaigns with spend >= this EUR threshold
         required: false
         default: "10"
         type: string
@@ -22,54 +22,38 @@ permissions:
 
 env:
   TIKTOK_BASE_URL: https://business-api.tiktok.com/open_api/v1.3
-  TIKTOK_ADVERTISER_ID: "7441895227339718673"
   MONITOR_ARTIFACT_NAME: tiktok-monitor-state
+  START_AFTER_HOURS: "6"
+  STOP_AFTER_HOURS: "23"
 
 jobs:
   spend-guard:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Load latest monitor artifact token (fallback)
+      - name: Resolve state from latest boost artifact
         id: state
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TOKEN_FROM_SECRET: ${{ secrets.TIKTOK_ACCESS_TOKEN }}
+          INPUT_CAMPAIGN_FILTER: ${{ inputs.campaign_name_contains }}
+          INPUT_SPEND_LIMIT: ${{ inputs.spend_limit_eur }}
         run: |
           set -euo pipefail
 
-          if [ -n "${TOKEN_FROM_SECRET:-}" ]; then
-            echo "token=" >> "$GITHUB_OUTPUT"
-            echo "TIKTOK_ACCESS_TOKEN secret is set; skipping artifact-token fetch."
+          if ! gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${MONITOR_ARTIFACT_NAME}&per_page=100" > /tmp/guard-artifacts.json; then
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            echo "No monitor artifact list available."
             exit 0
           fi
 
-          artifact_json="$(
-            curl -fsSL \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${MONITOR_ARTIFACT_NAME}&per_page=100" \
-            || true
-          )"
-          if [ -z "${artifact_json}" ]; then
-            echo "token=" >> "$GITHUB_OUTPUT"
-            echo "Artifact list fetch returned no data; continuing without artifact token."
-            exit 0
-          fi
-
-          artifact_id="$(ARTIFACT_JSON="${artifact_json}" python - <<'PY'
+          artifact_id="$(python - <<'PY'
           import json
-          import os
 
-          raw = os.environ.get("ARTIFACT_JSON", "")
-          if not raw.strip():
-              print("")
-              raise SystemExit(0)
           try:
-              payload = json.loads(raw)
-          except json.JSONDecodeError:
+              with open("/tmp/guard-artifacts.json", "r", encoding="utf-8") as fh:
+                  payload = json.load(fh)
+          except Exception:
               print("")
               raise SystemExit(0)
 
@@ -81,93 +65,114 @@ jobs:
           )"
 
           if [ -z "${artifact_id}" ]; then
-            echo "token=" >> "$GITHUB_OUTPUT"
+            echo "action=none" >> "$GITHUB_OUTPUT"
             echo "No monitor state artifact found."
             exit 0
           fi
 
-          if ! curl -fsSL -L \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
-            -o /tmp/tiktok-monitor-state.zip; then
-            echo "token=" >> "$GITHUB_OUTPUT"
-            echo "Artifact zip fetch failed for id=${artifact_id}; continuing without artifact token."
+          if ! gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > /tmp/guard-monitor.zip; then
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            echo "Unable to download monitor artifact zip."
             exit 0
           fi
 
-          token_value="$(python - <<'PY'
+          python - <<'PY'
+          import datetime as dt
           import json
+          import os
           import zipfile
 
-          path = "/tmp/tiktok-monitor-state.zip"
-          token = ""
-          with zipfile.ZipFile(path) as zf:
+          def parse_float(raw, default):
+              try:
+                  return float(str(raw).strip())
+              except Exception:
+                  return float(default)
+
+          with zipfile.ZipFile("/tmp/guard-monitor.zip", "r") as zf:
               names = zf.namelist()
               target = "monitor_state.json"
               if target not in names:
                   if len(names) == 1:
                       target = names[0]
                   else:
-                      print("")
+                      with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                          out.write("action=none\n")
+                      print(f"Invalid monitor artifact contents: {names}")
                       raise SystemExit(0)
               state = json.loads(zf.read(target).decode("utf-8"))
-              token = str(state.get("access_token") or "").strip()
-          print(token)
-          PY
-          )"
 
-          echo "::add-mask::${token_value}"
-          echo "token=${token_value}" >> "$GITHUB_OUTPUT"
+          token = str(state.get("access_token") or "").strip()
+          advertiser_id = str(state.get("advertiser_id") or "").strip()
+          started_at_raw = str(state.get("started_at") or "").strip()
+          if not token or not advertiser_id or not started_at_raw:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  out.write("action=none\n")
+              print("Monitor state missing required fields.")
+              raise SystemExit(0)
 
-      - name: Resolve guard context
-        id: ctx
-        shell: bash
-        env:
-          TOKEN_FROM_SECRET: ${{ secrets.TIKTOK_ACCESS_TOKEN }}
-          TOKEN_FROM_ARTIFACT: ${{ steps.state.outputs.token }}
-          INPUT_NAME_FILTER: ${{ inputs.campaign_name_contains }}
-          INPUT_SPEND_LIMIT: ${{ inputs.spend_limit_eur }}
-        run: |
-          python - <<'PY'
-          import os
-          import sys
+          started_at = dt.datetime.fromisoformat(started_at_raw.replace("Z", "+00:00"))
+          if started_at.tzinfo is None:
+              started_at = started_at.replace(tzinfo=dt.timezone.utc)
 
-          token = str(os.environ.get("TOKEN_FROM_SECRET") or "").strip()
-          if token:
-              token_source = "secret"
+          now = dt.datetime.now(dt.timezone.utc)
+          age_hours = (now - started_at).total_seconds() / 3600.0
+          start_after = parse_float(os.environ.get("START_AFTER_HOURS"), 6)
+          stop_after = parse_float(os.environ.get("STOP_AFTER_HOURS"), 23)
+
+          if age_hours < start_after:
+              action = "wait"
+          elif age_hours > stop_after:
+              action = "expired"
           else:
-              token = str(os.environ.get("TOKEN_FROM_ARTIFACT") or "").strip()
-              token_source = "artifact"
+              action = "check"
 
-          if not token:
-              print(
-                  "::error::No TikTok token available for spend guard. "
-                  "Set secret TIKTOK_ACCESS_TOKEN or run TikTok Boost Manual first to publish monitor artifact."
-              )
-              sys.exit(1)
+          input_filter = str(os.environ.get("INPUT_CAMPAIGN_FILTER") or "").strip()
+          name_filter = input_filter if input_filter else "Views"
 
-          try:
-              spend_limit = float(str(os.environ.get("INPUT_SPEND_LIMIT") or "10").strip())
-          except ValueError:
-              spend_limit = 10.0
+          input_spend_limit = str(os.environ.get("INPUT_SPEND_LIMIT") or "").strip()
+          if input_spend_limit:
+              spend_limit = parse_float(input_spend_limit, 10)
+          else:
+              spend_limit = parse_float(state.get("spend_limit_eur"), 10)
           if spend_limit <= 0:
               spend_limit = 10.0
 
-          name_filter = str(os.environ.get("INPUT_NAME_FILTER") or "Views").strip() or "Views"
-          print(f"Resolved spend guard context: token_source={token_source}, name_filter={name_filter}, spend_limit={spend_limit:.2f}")
           print(f"::add-mask::{token}")
-
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as envf:
               envf.write(f"GUARD_ACCESS_TOKEN={token}\n")
-              envf.write(f"GUARD_SPEND_LIMIT_EUR={spend_limit}\n")
+              envf.write(f"GUARD_ADVERTISER_ID={advertiser_id}\n")
               envf.write(f"GUARD_NAME_FILTER={name_filter}\n")
-              envf.write(f"GUARD_TOKEN_SOURCE={token_source}\n")
+              envf.write(f"GUARD_SPEND_LIMIT_EUR={spend_limit}\n")
+              envf.write(f"GUARD_STARTED_AT={started_at.isoformat()}\n")
+              envf.write(f"GUARD_AGE_HOURS={age_hours:.3f}\n")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"action={action}\n")
+              out.write(f"age_hours={age_hours:.3f}\n")
+              out.write(f"name_filter={name_filter}\n")
+              out.write(f"spend_limit={spend_limit}\n")
+
+          print(
+              f"Resolved guard state: action={action}, age={age_hours:.2f}h, "
+              f"filter={name_filter}, spend_limit={spend_limit:.2f}"
+          )
           PY
+
+      - name: Guard not initialized
+        if: steps.state.outputs.action == 'none'
+        run: echo "No usable monitor state yet. Run TikTok Boost Manual first."
+
+      - name: Waiting for +6h window
+        if: steps.state.outputs.action == 'wait'
+        run: echo "Skipping; monitor age is ${{ steps.state.outputs.age_hours }}h (< ${START_AFTER_HOURS}h)."
+
+      - name: Token window expired (>23h)
+        if: steps.state.outputs.action == 'expired'
+        run: echo "Skipping; monitor age is ${{ steps.state.outputs.age_hours }}h (> ${STOP_AFTER_HOURS}h)."
 
       - name: Disable over-budget active Views campaigns
         id: guard
+        if: steps.state.outputs.action == 'check'
         shell: bash
         run: |
           python - <<'PY'
@@ -178,10 +183,10 @@ jobs:
           import urllib.request
 
           base_url = os.environ["TIKTOK_BASE_URL"].rstrip("/")
-          advertiser_id = str(os.environ["TIKTOK_ADVERTISER_ID"]).strip()
           access_token = str(os.environ["GUARD_ACCESS_TOKEN"]).strip()
-          name_filter = str(os.environ.get("GUARD_NAME_FILTER") or "Views").strip().lower()
-          spend_limit = float(str(os.environ.get("GUARD_SPEND_LIMIT_EUR") or "10"))
+          advertiser_id = str(os.environ["GUARD_ADVERTISER_ID"]).strip()
+          name_filter = str(os.environ["GUARD_NAME_FILTER"]).strip().lower()
+          spend_limit = float(str(os.environ["GUARD_SPEND_LIMIT_EUR"]).strip())
 
           def api_get(path, params):
               url = f"{base_url}{path}?{urllib.parse.urlencode(params)}"
@@ -219,7 +224,7 @@ jobs:
               if isinstance(data, list):
                   return data
               if isinstance(data, dict):
-                  for key in ("list", "campaigns", "data", "results", "rows"):
+                  for key in ("list", "campaigns", "results", "rows", "data"):
                       value = data.get(key)
                       if isinstance(value, list):
                           return value
@@ -228,10 +233,10 @@ jobs:
           def to_float(value):
               try:
                   return float(value)
-              except (TypeError, ValueError):
+              except Exception:
                   return 0.0
 
-          # 1) Fetch campaigns with pagination.
+          # Campaign scan
           campaigns = []
           page = 1
           while True:
@@ -239,8 +244,8 @@ jobs:
                   "/campaign/get/",
                   {
                       "advertiser_id": advertiser_id,
-                      "page": page,
-                      "page_size": 100,
+                      "page": str(page),
+                      "page_size": "100",
                   },
               )
               items = extract_list(data)
@@ -260,8 +265,8 @@ jobs:
 
           candidates = []
           for c in campaigns:
-              name = str(c.get("campaign_name") or c.get("name") or "").strip()
               cid = str(c.get("campaign_id") or c.get("id") or "").strip()
+              name = str(c.get("campaign_name") or c.get("name") or "").strip()
               if not cid or not name:
                   continue
               if name_filter not in name.lower():
@@ -270,10 +275,8 @@ jobs:
                   continue
               candidates.append({"campaign_id": cid, "campaign_name": name})
 
-          # 2) Reporting spend (today UTC).
-          today = dt.datetime.now(dt.timezone.utc).date().isoformat()
           spend_map = {c["campaign_id"]: 0.0 for c in candidates}
-
+          today = dt.datetime.now(dt.timezone.utc).date().isoformat()
           page = 1
           while True:
               data = api_get(
@@ -293,7 +296,6 @@ jobs:
               rows = extract_list(data)
               if not rows:
                   break
-
               for row in rows:
                   if not isinstance(row, dict):
                       continue
@@ -305,19 +307,17 @@ jobs:
                   if spend <= 0 and isinstance(metrics, dict):
                       spend = to_float(metrics.get("spend"))
                   spend_map[cid] = max(spend_map.get(cid, 0.0), spend)
-
               if len(rows) < 200:
                   break
               page += 1
 
           disable_items = []
           for c in candidates:
-              cid = c["campaign_id"]
-              spend = spend_map.get(cid, 0.0)
+              spend = spend_map.get(c["campaign_id"], 0.0)
               if spend >= spend_limit:
                   disable_items.append(
                       {
-                          "campaign_id": cid,
+                          "campaign_id": c["campaign_id"],
                           "campaign_name": c["campaign_name"],
                           "spend_eur": round(spend, 4),
                       }
@@ -335,15 +335,13 @@ jobs:
               )
 
           result = {
-              "name_filter": name_filter,
-              "spend_limit_eur": spend_limit,
               "checked_active_views_campaigns": len(candidates),
               "disabled_campaigns_count": len(disable_items),
               "disabled_campaigns": disable_items,
-              "token_source": os.environ.get("GUARD_TOKEN_SOURCE", "unknown"),
+              "name_filter": name_filter,
+              "spend_limit_eur": spend_limit,
               "date_utc": today,
           }
-
           with open("guard_result.json", "w", encoding="utf-8") as fh:
               json.dump(result, fh)
 
@@ -355,7 +353,7 @@ jobs:
           PY
 
       - name: Send Slack summary
-        if: success()
+        if: success() && steps.state.outputs.action == 'check'
         continue-on-error: true
         shell: bash
         env:
@@ -372,7 +370,7 @@ jobs:
 
           token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
           if not token:
-              print("SLACK_BOT_TOKEN not set; skipping Slack summary notification.")
+              print("SLACK_BOT_TOKEN not set; skipping Slack summary.")
               raise SystemExit(0)
 
           try:
@@ -381,49 +379,49 @@ jobs:
           except Exception:
               result = {}
 
+          disabled = result.get("disabled_campaigns") or []
+          if disabled:
+              disabled_lines = "\n".join(
+                  f"- {item.get('campaign_name')} ({item.get('campaign_id')}): €{item.get('spend_eur')}"
+                  for item in disabled
+              )
+          else:
+              disabled_lines = "- none"
+
           repo = os.environ.get("GITHUB_REPOSITORY", "")
           run_id = os.environ.get("GITHUB_RUN_ID", "")
           run_url = f"https://github.com/{repo}/actions/runs/{run_id}" if repo and run_id else ""
 
-          disabled = result.get("disabled_campaigns") or []
-          if disabled:
-              lines = "\n".join(
-                  f"- {c.get('campaign_name')} ({c.get('campaign_id')}): €{c.get('spend_eur')}"
-                  for c in disabled
-              )
-          else:
-              lines = "- none"
-
           text = (
               "TikTok Spend Guard Completed\n"
-              f"Checked active \"Views\" campaigns: {os.environ.get('CHECKED_COUNT', '0')}\n"
-              f"Disabled over-budget campaigns: {os.environ.get('DISABLED_COUNT', '0')}\n"
-              f"Limit (EUR, today UTC): {result.get('spend_limit_eur', '10')}\n"
-              f"Disabled list:\n{lines}\n"
+              f"Checked active Views campaigns: {os.environ.get('CHECKED_COUNT', '0')}\n"
+              f"Disabled campaigns: {os.environ.get('DISABLED_COUNT', '0')}\n"
+              f"Limit (EUR): {result.get('spend_limit_eur', '10')}\n"
+              f"Disabled list:\n{disabled_lines}\n"
               f"Run: {run_url}"
           )
-
-          payload = {
-              "channel": os.environ.get("SLACK_CHANNEL_ID", "C0A49B277UK"),
-              "text": text,
-              "unfurl_links": False,
-              "unfurl_media": False,
-          }
 
           req = urllib.request.Request(
               url="https://slack.com/api/chat.postMessage",
               method="POST",
-              data=json.dumps(payload).encode("utf-8"),
+              data=json.dumps(
+                  {
+                      "channel": os.environ.get("SLACK_CHANNEL_ID", "C0A49B277UK"),
+                      "text": text,
+                      "unfurl_links": False,
+                      "unfurl_media": False,
+                  }
+              ).encode("utf-8"),
               headers={
                   "Authorization": f"Bearer {token}",
                   "Content-Type": "application/json; charset=utf-8",
               },
           )
+
           try:
               raw = urllib.request.urlopen(req, timeout=20).read().decode("utf-8")
           except urllib.error.HTTPError as exc:
-              body = exc.read().decode("utf-8", errors="replace")
-              print(f"Slack summary failed with HTTP {exc.code}: {body}")
+              print(f"Slack summary HTTP error {exc.code}: {exc.read().decode('utf-8', errors='replace')}")
               raise SystemExit(0)
           except urllib.error.URLError as exc:
               print(f"Slack summary network error: {exc}")
@@ -431,9 +429,9 @@ jobs:
 
           parsed = json.loads(raw)
           if not parsed.get("ok"):
-              print(f"Slack API returned error for summary message: {parsed}")
+              print(f"Slack API summary error: {parsed}")
           else:
-              print("Slack summary notification sent.")
+              print("Slack summary sent.")
           PY
 
       - name: Send Slack error notification
@@ -444,7 +442,6 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: C0A49B277UK
           OUTCOME_STATE: ${{ steps.state.outcome }}
-          OUTCOME_CTX: ${{ steps.ctx.outcome }}
           OUTCOME_GUARD: ${{ steps.guard.outcome }}
         run: |
           python - <<'PY'
@@ -455,12 +452,11 @@ jobs:
 
           token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
           if not token:
-              print("SLACK_BOT_TOKEN not set; skipping failure Slack notification.")
+              print("SLACK_BOT_TOKEN not set; skipping Slack failure notification.")
               raise SystemExit(0)
 
           outcomes = [
-              ("Load latest monitor artifact token", os.environ.get("OUTCOME_STATE", "")),
-              ("Resolve guard context", os.environ.get("OUTCOME_CTX", "")),
+              ("Resolve state from latest boost artifact", os.environ.get("OUTCOME_STATE", "")),
               ("Disable over-budget active Views campaigns", os.environ.get("OUTCOME_GUARD", "")),
           ]
           failed_step = next((name for name, outcome in outcomes if outcome == "failure"), "Unknown")
@@ -468,26 +464,26 @@ jobs:
           repo = os.environ.get("GITHUB_REPOSITORY", "")
           run_id = os.environ.get("GITHUB_RUN_ID", "")
           actor = os.environ.get("GITHUB_ACTOR", "")
-          workflow = os.environ.get("GITHUB_WORKFLOW", "TikTok Spend Guard")
           run_url = f"https://github.com/{repo}/actions/runs/{run_id}" if repo and run_id else ""
 
           text = (
-              f":x: {workflow} failed\n"
+              ":x: TikTok Spend Guard failed\n"
               f"Failed step: {failed_step}\n"
               f"Actor: {actor}\n"
               f"Run: {run_url}"
           )
 
-          payload = {
-              "channel": os.environ.get("SLACK_CHANNEL_ID", "C0A49B277UK"),
-              "text": text,
-              "unfurl_links": False,
-              "unfurl_media": False,
-          }
           req = urllib.request.Request(
               url="https://slack.com/api/chat.postMessage",
               method="POST",
-              data=json.dumps(payload).encode("utf-8"),
+              data=json.dumps(
+                  {
+                      "channel": os.environ.get("SLACK_CHANNEL_ID", "C0A49B277UK"),
+                      "text": text,
+                      "unfurl_links": False,
+                      "unfurl_media": False,
+                  }
+              ).encode("utf-8"),
               headers={
                   "Authorization": f"Bearer {token}",
                   "Content-Type": "application/json; charset=utf-8",
@@ -496,16 +492,15 @@ jobs:
           try:
               raw = urllib.request.urlopen(req, timeout=20).read().decode("utf-8")
           except urllib.error.HTTPError as exc:
-              body = exc.read().decode("utf-8", errors="replace")
-              print(f"Slack failure-notification failed with HTTP {exc.code}: {body}")
+              print(f"Slack failure HTTP error {exc.code}: {exc.read().decode('utf-8', errors='replace')}")
               raise SystemExit(0)
           except urllib.error.URLError as exc:
-              print(f"Slack failure-notification network error: {exc}")
+              print(f"Slack failure network error: {exc}")
               raise SystemExit(0)
 
           parsed = json.loads(raw)
           if not parsed.get("ok"):
-              print(f"Slack API returned error for failure message: {parsed}")
+              print(f"Slack API failure error: {parsed}")
           else:
               print("Slack failure notification sent.")
           PY
