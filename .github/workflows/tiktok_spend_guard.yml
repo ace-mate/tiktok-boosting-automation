@@ -35,6 +35,7 @@ jobs:
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          TOKEN_FROM_SECRET: ${{ secrets.TIKTOK_ACCESS_TOKEN }}
         run: |
           python - <<'PY'
           import io
@@ -47,6 +48,14 @@ jobs:
           repo = os.environ["GITHUB_REPOSITORY"]
           token = os.environ["GITHUB_TOKEN"]
           artifact_name = os.environ["MONITOR_ARTIFACT_NAME"]
+          token_from_secret = str(os.environ.get("TOKEN_FROM_SECRET") or "").strip()
+
+          if token_from_secret:
+              # Secret token takes priority; no need to download artifact token.
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  out.write("token=\n")
+              print("TIKTOK_ACCESS_TOKEN secret is set; skipping artifact-token fetch.")
+              raise SystemExit(0)
 
           headers = {
               "Authorization": f"Bearer {token}",
@@ -59,7 +68,13 @@ jobs:
               f"?name={urllib.parse.quote(artifact_name)}&per_page=100"
           )
           req = urllib.request.Request(list_url, method="GET", headers=headers)
-          payload = json.loads(urllib.request.urlopen(req, timeout=30).read().decode("utf-8"))
+          try:
+              payload = json.loads(urllib.request.urlopen(req, timeout=30).read().decode("utf-8"))
+          except Exception as exc:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  out.write("token=\n")
+              print(f"Artifact list fetch failed; continuing without artifact token: {exc}")
+              raise SystemExit(0)
 
           artifacts = payload.get("artifacts") or []
           artifacts = [a for a in artifacts if isinstance(a, dict) and not a.get("expired")]
@@ -79,7 +94,13 @@ jobs:
               raise SystemExit(0)
 
           req = urllib.request.Request(archive_url, method="GET", headers=headers)
-          zip_bytes = urllib.request.urlopen(req, timeout=30).read()
+          try:
+              zip_bytes = urllib.request.urlopen(req, timeout=30).read()
+          except Exception as exc:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  out.write("token=\n")
+              print(f"Artifact archive fetch failed; continuing without artifact token: {exc}")
+              raise SystemExit(0)
           with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
               names = zf.namelist()
               target = "monitor_state.json"
