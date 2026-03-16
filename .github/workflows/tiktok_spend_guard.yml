@@ -34,88 +34,64 @@ jobs:
         id: state
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
           TOKEN_FROM_SECRET: ${{ secrets.TIKTOK_ACCESS_TOKEN }}
         run: |
-          python - <<'PY'
-          import io
+          set -euo pipefail
+
+          if [ -n "${TOKEN_FROM_SECRET:-}" ]; then
+            echo "token=" >> "$GITHUB_OUTPUT"
+            echo "TIKTOK_ACCESS_TOKEN secret is set; skipping artifact-token fetch."
+            exit 0
+          fi
+
+          artifact_id="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${MONITOR_ARTIFACT_NAME}&per_page=100" | python - <<'PY'
           import json
-          import os
-          import urllib.parse
-          import urllib.request
-          import zipfile
+          import sys
 
-          repo = os.environ["GITHUB_REPOSITORY"]
-          token = os.environ["GITHUB_TOKEN"]
-          artifact_name = os.environ["MONITOR_ARTIFACT_NAME"]
-          token_from_secret = str(os.environ.get("TOKEN_FROM_SECRET") or "").strip()
-
-          if token_from_secret:
-              # Secret token takes priority; no need to download artifact token.
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-                  out.write("token=\n")
-              print("TIKTOK_ACCESS_TOKEN secret is set; skipping artifact-token fetch.")
-              raise SystemExit(0)
-
-          headers = {
-              "Authorization": f"Bearer {token}",
-              "Accept": "application/vnd.github+json",
-              "X-GitHub-Api-Version": "2022-11-28",
-          }
-
-          list_url = (
-              f"https://api.github.com/repos/{repo}/actions/artifacts"
-              f"?name={urllib.parse.quote(artifact_name)}&per_page=100"
-          )
-          req = urllib.request.Request(list_url, method="GET", headers=headers)
-          try:
-              payload = json.loads(urllib.request.urlopen(req, timeout=30).read().decode("utf-8"))
-          except Exception as exc:
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-                  out.write("token=\n")
-              print(f"Artifact list fetch failed; continuing without artifact token: {exc}")
-              raise SystemExit(0)
-
+          payload = json.load(sys.stdin)
           artifacts = payload.get("artifacts") or []
           artifacts = [a for a in artifacts if isinstance(a, dict) and not a.get("expired")]
-          if not artifacts:
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-                  out.write("token=\n")
-              print("No monitor state artifact found.")
-              raise SystemExit(0)
-
           artifacts.sort(key=lambda a: str(a.get("created_at") or ""), reverse=True)
-          artifact = artifacts[0]
-          archive_url = str(artifact.get("archive_download_url") or "").strip()
-          if not archive_url:
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-                  out.write("token=\n")
-              print("Latest monitor artifact has no archive_download_url.")
-              raise SystemExit(0)
+          print(str(artifacts[0].get("id") or "").strip() if artifacts else "")
+          PY
+          )"
 
-          req = urllib.request.Request(archive_url, method="GET", headers=headers)
-          try:
-              zip_bytes = urllib.request.urlopen(req, timeout=30).read()
-          except Exception as exc:
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-                  out.write("token=\n")
-              print(f"Artifact archive fetch failed; continuing without artifact token: {exc}")
-              raise SystemExit(0)
-          with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+          if [ -z "${artifact_id}" ]; then
+            echo "token=" >> "$GITHUB_OUTPUT"
+            echo "No monitor state artifact found."
+            exit 0
+          fi
+
+          if ! gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > /tmp/tiktok-monitor-state.zip; then
+            echo "token=" >> "$GITHUB_OUTPUT"
+            echo "Artifact zip fetch failed for id=${artifact_id}; continuing without artifact token."
+            exit 0
+          fi
+
+          token_value="$(python - <<'PY'
+          import json
+          import zipfile
+
+          path = "/tmp/tiktok-monitor-state.zip"
+          token = ""
+          with zipfile.ZipFile(path) as zf:
               names = zf.namelist()
               target = "monitor_state.json"
               if target not in names:
                   if len(names) == 1:
                       target = names[0]
                   else:
-                      raise RuntimeError(f"monitor_state.json not found in artifact files: {names}")
+                      print("")
+                      raise SystemExit(0)
               state = json.loads(zf.read(target).decode("utf-8"))
-
-          token_value = str(state.get("access_token") or "").strip()
-          print(f"::add-mask::{token_value}")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write(f"token={token_value}\n")
+              token = str(state.get("access_token") or "").strip()
+          print(token)
           PY
+          )"
+
+          echo "::add-mask::${token_value}"
+          echo "token=${token_value}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve guard context
         id: ctx
