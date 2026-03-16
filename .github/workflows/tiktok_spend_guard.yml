@@ -23,7 +23,7 @@ permissions:
 env:
   TIKTOK_BASE_URL: https://business-api.tiktok.com/open_api/v1.3
   MONITOR_ARTIFACT_NAME: tiktok-monitor-state
-  START_AFTER_HOURS: "0"
+  START_AFTER_HOURS: "6"
   STOP_AFTER_HOURS: "23"
 
 jobs:
